@@ -54,6 +54,19 @@ while [ $# -gt 0 ]; do
 done
 set -- ${_args[@]+"${_args[@]}"}
 
+# This serves on the Linux host that has the GPUs; say so instead of failing
+# somewhere deep inside docker/nvidia-smi (e.g. when run on a laptop).
+case "${1:-start}" in
+    -h|--help|help) ;;
+    *)
+        if [ "$(uname -s)" != "Linux" ]; then
+            echo "[dsv41-exl3] ERROR: run ./start.sh on the Linux host with the 2x RTX PRO 6000 (this is $(uname -s) $(uname -m))." >&2
+            echo "[dsv41-exl3]        clone the repo there: git clone https://github.com/essefree/DeepSeek-v4.1-Flash-EXL3-2x-RTX6000Pro.git" >&2
+            exit 1
+        fi
+        ;;
+esac
+
 if [ ! -f "$SCRIPT_DIR/.env" ]; then
     [ -f "$SCRIPT_DIR/.env.example" ] || { echo "ERROR: missing .env.example" >&2; exit 1; }
     cp "$SCRIPT_DIR/.env.example" "$SCRIPT_DIR/.env"
@@ -65,9 +78,9 @@ _cli_keys=(SPEC_METHOD ENFORCE_EAGER EXL3_FUSED_MOE EXL3_MOE_ROW_TILE EXL3_TEMP_
            IMAGE GPU_MEM_UTIL LANGUAGE_MODEL_ONLY MAX_NUM_SEQS MAX_MODEL_LEN DSPARK_TOKENS
            DSV41_EXL3_HOST_EXPERT_LAYERS GPUS MODEL MODEL_HOST HF_MODEL_REPO HF_MODEL_REVISION
            ENGRAM_DIR KMAP_HOST EXPECTED_SHARDS)
-declare -A _cli=()
+# (plain _cli_<KEY> variables, not an associative array: macOS ships bash 3.2)
 for _k in "${_cli_keys[@]}"; do
-    [ -n "${!_k-}" ] && _cli[$_k]="${!_k}"
+    if [ -n "${!_k-}" ]; then printf -v "_cli_$_k" '%s' "${!_k}"; fi
 done
 _cli_spinwait_ms_set="${GLM53_SPINWAIT_MS+1}"
 _cli_spinwait_ms="${GLM53_SPINWAIT_MS-}"
@@ -75,12 +88,15 @@ set -a
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/.env"
 set +a
-for _k in "${!_cli[@]}"; do printf -v "$_k" '%s' "${_cli[$_k]}"; done
+for _k in "${_cli_keys[@]}"; do
+    _v="_cli_$_k"
+    if [ -n "${!_v-}" ]; then printf -v "$_k" '%s' "${!_v}"; fi
+done
 [ -n "${_cli_spinwait_ms_set}" ] && GLM53_SPINWAIT_MS="$_cli_spinwait_ms"
 # --model on the command line replaces any MODEL_HOST/HF_MODEL_REPO from .env.
-if [ -n "${_cli[MODEL]:-}" ]; then
-    [ -n "${_cli[MODEL_HOST]:-}" ] || MODEL_HOST=""
-    [ -n "${_cli[HF_MODEL_REPO]:-}" ] || HF_MODEL_REPO=""
+if [ -n "${_cli_MODEL:-}" ]; then
+    [ -n "${_cli_MODEL_HOST:-}" ] || MODEL_HOST=""
+    [ -n "${_cli_HF_MODEL_REPO:-}" ] || HF_MODEL_REPO=""
 fi
 # An explicit KMAP_HOST wins over a K map shipped inside the checkpoint.
 [ -n "${KMAP_HOST:-}" ] && _DSV41_KMAP_PINNED=1
