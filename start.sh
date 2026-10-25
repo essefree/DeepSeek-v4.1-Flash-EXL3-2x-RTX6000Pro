@@ -29,12 +29,30 @@
 #   ./start.sh status             container + API health + VRAM
 #   ./start.sh logs               follow logs
 #
+# Checkpoint (any command): --model <dir | hf-org/name>  [--revision <rev>]
+#   ./start.sh --model /data/models/my-dsv41-exl3        serve a local directory as-is
+#   ./start.sh --model my-hf-user/my-dsv41-exl3          fetch that HF repo, then serve
+#   (same as MODEL=... in .env or on the command line; default Mia-AiLab 2.9bpw)
+#
 # Settings live in .env (copied from .env.example on first run).
 # One-shot overrides: BUILD=1 SKIP_BUILD=1 SKIP_OVERLAY_VERIFY=1 TAIL=1
 # ============================================================================
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+
+# --model / --revision may appear anywhere on the command line.
+_args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --model)      [ $# -ge 2 ] || { echo "--model needs a value" >&2; exit 2; }; MODEL="$2"; shift 2 ;;
+        --model=*)    MODEL="${1#--model=}"; shift ;;
+        --revision)   [ $# -ge 2 ] || { echo "--revision needs a value" >&2; exit 2; }; HF_MODEL_REVISION="$2"; shift 2 ;;
+        --revision=*) HF_MODEL_REVISION="${1#--revision=}"; shift ;;
+        *)            _args+=("$1"); shift ;;
+    esac
+done
+set -- ${_args[@]+"${_args[@]}"}
 
 if [ ! -f "$SCRIPT_DIR/.env" ]; then
     [ -f "$SCRIPT_DIR/.env.example" ] || { echo "ERROR: missing .env.example" >&2; exit 1; }
@@ -45,7 +63,8 @@ fi
 _cli_keys=(SPEC_METHOD ENFORCE_EAGER EXL3_FUSED_MOE EXL3_MOE_ROW_TILE EXL3_TEMP_ROWS_FUSED
            EXL3_FAT_SORTED EXL3_FAT_BATCHED EXL3_FAT_KERNEL EXL3_FAT_GROUPED MAX_NUM_BATCHED_TOKENS
            IMAGE GPU_MEM_UTIL LANGUAGE_MODEL_ONLY MAX_NUM_SEQS MAX_MODEL_LEN DSPARK_TOKENS
-           DSV41_EXL3_HOST_EXPERT_LAYERS GPUS)
+           DSV41_EXL3_HOST_EXPERT_LAYERS GPUS MODEL MODEL_HOST HF_MODEL_REPO HF_MODEL_REVISION
+           ENGRAM_DIR KMAP_HOST EXPECTED_SHARDS)
 declare -A _cli=()
 for _k in "${_cli_keys[@]}"; do
     [ -n "${!_k-}" ] && _cli[$_k]="${!_k}"
@@ -58,6 +77,13 @@ source "$SCRIPT_DIR/.env"
 set +a
 for _k in "${!_cli[@]}"; do printf -v "$_k" '%s' "${_cli[$_k]}"; done
 [ -n "${_cli_spinwait_ms_set}" ] && GLM53_SPINWAIT_MS="$_cli_spinwait_ms"
+# --model on the command line replaces any MODEL_HOST/HF_MODEL_REPO from .env.
+if [ -n "${_cli[MODEL]:-}" ]; then
+    [ -n "${_cli[MODEL_HOST]:-}" ] || MODEL_HOST=""
+    [ -n "${_cli[HF_MODEL_REPO]:-}" ] || HF_MODEL_REPO=""
+fi
+# An explicit KMAP_HOST wins over a K map shipped inside the checkpoint.
+[ -n "${KMAP_HOST:-}" ] && _DSV41_KMAP_PINNED=1
 
 # ----------------------------- configuration -------------------------------
 IMAGE="${IMAGE:-dsv41-flash-exl3-rtx6000:2.9bpw}"
@@ -122,13 +148,11 @@ VLLM_API_KEY="${VLLM_API_KEY:-}"
 
 CONTAINER="${CONTAINER:-dsv41-exl3}"
 
-MODEL_HOST="${MODEL_HOST:-$SCRIPT_DIR/model}"
 ENGRAM_DIR="${ENGRAM_DIR:-$SCRIPT_DIR/engram-src}"
-HF_MODEL_REPO="${HF_MODEL_REPO:-Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw}"
 HF_ENGRAM_REPO="${HF_ENGRAM_REPO:-deepseek-ai/DeepSeek-V4.1-Flash}"
 AUTO_DOWNLOAD="${AUTO_DOWNLOAD:-1}"
 # docker -v needs absolute paths; .env may give them relative to this checkout.
-for _v in MODEL_HOST ENGRAM_DIR; do
+for _v in ENGRAM_DIR; do
     case "${!_v}" in /*) ;; *) printf -v "$_v" '%s' "$SCRIPT_DIR/${!_v#./}" ;; esac
 done
 CACHE_ROOT="${CACHE_ROOT:-$HOME/.cache/vllm-dsv41-flash-exl3}"
@@ -153,7 +177,10 @@ PACKED_MOUNT="${PACKED_MOUNT:-/engram-packed}"
 LOGDIR="$SCRIPT_DIR/logs"
 INNER_SCRIPT="$SCRIPT_DIR/.dsv41-exl3.inner.sh"
 HEAD_SCRIPT="$INNER_SCRIPT"
-EXPECTED_SHARDS="${EXPECTED_SHARDS:-39}"
+# MODEL / MODEL_HOST / HF_MODEL_REPO -> MODEL_HOST (absolute), EXPECTED_SHARDS, KMAP_HOST.
+# shellcheck source=scripts/resolve_model.sh
+source "$SCRIPT_DIR/scripts/resolve_model.sh"
+resolve_model || exit 2
 
 # ------------------------------- helpers -----------------------------------
 log()  { printf '\033[1;36m[dsv41-exl3]\033[0m %s\n' "$*"; }
@@ -251,7 +278,7 @@ prepare_engram_src_dir() {
         || die "failed to build slim Engram src at $ENGRAM_SRC (need shards 47+48 under $ENGRAM_DIR)"
 }
 
-usage() { sed -n '2,34p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 count_model_shards() {
     find "$1" -maxdepth 1 -name 'model-*.safetensors' 2>/dev/null | wc -l | tr -d '[:space:]' || true
@@ -294,8 +321,12 @@ engram_complete() {
 fetch_weights() {
     local need_model=0 need_engram=0 have
     have="$(count_model_shards "$MODEL_HOST")"
-    [ "${have:-0}" -ge "$EXPECTED_SHARDS" ] && [ -f "$MODEL_HOST/config.json" ] || need_model=1
+    [ "${have:-0}" -ge "$EXPECTED_SHARDS" ] && [ -f "$MODEL_HOST/config.json" ] \
+        && [ -f "$MODEL_HOST/model.safetensors.index.json" ] || need_model=1
     engram_complete || need_engram=1
+    if [ "$need_model" = "1" ] && [ "$MODEL_SOURCE" = "local" ]; then
+        die "MODEL=$MODEL_HOST is a local checkpoint but it is incomplete (${have:-0}/$EXPECTED_SHARDS shards, needs config.json + model.safetensors.index.json); local paths are never downloaded into"
+    fi
     [ "$need_model" = "0" ] && [ "$need_engram" = "0" ] && return 0
 
     if [ "${AUTO_DOWNLOAD:-1}" != "1" ]; then
@@ -307,9 +338,12 @@ fetch_weights() {
     export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
 
     if [ "$need_model" = "1" ]; then
-        log "fetching EXL3 weights from ${HF_MODEL_REPO} into ${MODEL_HOST} (~197 GiB, resumable)"
+        local rev=()
+        [ -n "${HF_MODEL_REVISION:-}" ] && rev=(--revision "$HF_MODEL_REVISION")
+        log "fetching EXL3 weights from ${HF_MODEL_REPO}${HF_MODEL_REVISION:+@$HF_MODEL_REVISION} into ${MODEL_HOST} (Mia 2.9bpw is ~197 GiB; resumable; private repos need HF_TOKEN)"
         mkdir -p "$MODEL_HOST"
-        hf_fetch "$HF_MODEL_REPO" "$MODEL_HOST" "EXL3 weights"
+        hf_fetch "$HF_MODEL_REPO" "$MODEL_HOST" "EXL3 weights" ${rev[@]+"${rev[@]}"}
+        resolve_model_files
     fi
     if [ "$need_engram" = "1" ]; then
         log "fetching Engram shards 47+48 from ${HF_ENGRAM_REPO} into ${ENGRAM_DIR} (~190 GiB, resumable)"
@@ -524,9 +558,12 @@ preflight() {
 
     check_port_free "$PORT" PORT
     [ -f "$EXL3_OVERLAY_HOST" ] || die "$EXL3_OVERLAY_HOST missing"
-    [ -f "$KMAP_HOST" ] || die "$KMAP_HOST missing"
     [ -f "$CHAT_TEMPLATE_HOST" ] || die "$CHAT_TEMPLATE_HOST missing"
+    log "checkpoint: ${MODEL_HOST} (source: ${MODEL_SOURCE}$([ "$MODEL_SOURCE" = hf ] && printf ' %s' "$HF_MODEL_REPO"))"
     fetch_weights
+    [ -f "$KMAP_HOST" ] || die "K map $KMAP_HOST missing"
+    log "K map: ${KMAP_HOST}"
+    check_model_config
 
     [ -f "$MODEL_HOST/config.json" ] || die "EXL3 checkpoint missing config.json at $MODEL_HOST"
     local have
@@ -589,6 +626,29 @@ launch() {
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
     mkdir -p "$CACHE_ROOT" "$TRITON_HOST_CACHE" "$TILELANG_HOST_CACHE" "$LOGDIR"
 
+    # Checkpoint mount. A Hugging Face cache snapshot is a tree of relative
+    # symlinks into ../../blobs, so mount the whole models--org--name dir; any
+    # other symlinked tree is mounted at its own path along with its targets.
+    local -a modelmnt=(-v "$MODEL_HOST:/model:ro")
+    MODEL_DIR=/model
+    if find "$MODEL_HOST" -maxdepth 1 -type l 2>/dev/null | grep -q .; then
+        case "$MODEL_HOST" in
+            */snapshots/*)
+                modelmnt=(-v "${MODEL_HOST%/snapshots/*}:/hf-model:ro")
+                MODEL_DIR="/hf-model/snapshots/${MODEL_HOST##*/snapshots/}"
+                ;;
+            *)
+                modelmnt=(-v "$MODEL_HOST:$MODEL_HOST:ro")
+                MODEL_DIR="$MODEL_HOST"
+                local tdir
+                while read -r tdir; do
+                    [ -n "$tdir" ] && modelmnt+=(-v "$tdir:$tdir:ro")
+                done < <(find "$MODEL_HOST" -maxdepth 1 -type l -exec readlink -f {} \; | xargs -r -n1 dirname | sort -u | grep -vx "$MODEL_HOST" || true)
+                ;;
+        esac
+        log "checkpoint is a symlinked tree — mounted so the links resolve (in-container ${MODEL_DIR})"
+    fi
+
     local -a packed=()
     if [ -f "$PACKED_DIR/engram-l1-r0of${TP}.bin" ]; then
         packed=(-v "$PACKED_DIR:$PACKED_MOUNT:ro" -e "DSV41_PACKED_DIR=$PACKED_MOUNT")
@@ -634,7 +694,7 @@ launch() {
         --gpus "$GPUS" --network host --ipc=host --shm-size 32g --stop-timeout 60 \
         --ulimit memlock=-1 --ulimit stack=67108864 \
         --cap-add SYS_PTRACE --oom-score-adj 1000 \
-        -v "$MODEL_HOST:/model:ro" \
+        "${modelmnt[@]}" \
         -v "$ENGRAM_SRC:/engram-src:ro" \
         -v "$ENGRAM_DIR:$ENGRAM_DIR:ro" \
         -v "$CACHE_ROOT:/root/.cache/vllm" \

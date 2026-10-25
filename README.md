@@ -70,6 +70,28 @@ cp .env.example .env      # first run also does this; review GPUS / DSV41_EXL3_H
 ./start.sh                # fetch weights, build the sm_120 image, GPU self-check, serve :8888
 ```
 
+### Choosing the checkpoint
+
+```bash
+./start.sh --model /data/models/DeepSeek-V4.1-Flash-EXL3-2.9bpw   # local directory, served as-is
+./start.sh --model your-hf-user/your-exl3-quant                     # Hugging Face repo, fetched first
+./start.sh --model your-hf-user/your-exl3-quant --revision v2       # a branch, tag or commit
+```
+
+Or set `MODEL=` in `.env` (same two forms). With nothing set, it uses Mia's 2.9bpw repo in `./model`.
+- **Local directories:** mounted read-only and never downloaded into. An incomplete one stops the boot with the
+  shard count it found.
+- **Hugging Face repos:** each one gets its own `./models/<user>__<name>` directory. For a private repo,
+  `export HF_TOKEN=...` first.
+- **Shard count:** read from the checkpoint's `model.safetensors.index.json`.
+- **K map:** a checkpoint that ships `exl3_k_map.json` next to its `config.json` uses that map instead of
+  `files/exl3_k_map.json`. Set `KMAP_HOST` to force one.
+- **Checks:** the preflight prints the checkpoint's `quant_method`/`codebook`/`avg_bits` and warns when they don't
+  match what the overlay loads.
+
+`./download.sh --model ...` stages a download without booting. For a quant other than Mia's 2.9bpw, re-check the
+VRAM split with `python3 scripts/weight_budget.py --model <dir> --host-expert-layers 33-39`.
+
 The first run builds the image (it compiles exllamav3 and the E3 v2 kernels for `sm_120a`), then runs the GPU
 self-check, including the new `test_host_experts.py` UVA check. Later runs rebuild only when
 `Dockerfile`/`overlay`/`files`/`tests` change.
