@@ -188,7 +188,18 @@ def _dsv41_install_memory_log() -> None:
             return
         state = {"calls": 0, "skipped": 0, "in_prefill": False, "end_calls": 0}
 
+        # DSV41_MEM_SOURCE=cuda (discrete GPUs, e.g. RTX PRO 6000): the headroom
+        # that matters is free VRAM, not host MemAvailable. meminfo = GB10 UMA.
+        mem_source = os.environ.get("DSV41_MEM_SOURCE", "meminfo").strip().lower()
+
         def _memavail_gib():
+            if mem_source == "cuda":
+                try:
+                    import torch
+
+                    return torch.cuda.mem_get_info()[0] / (1024 * 1024 * 1024)
+                except Exception:
+                    return 0.0
             try:
                 with open("/proc/meminfo") as fh:
                     for line in fh:
@@ -259,7 +270,7 @@ def _dsv41_install_memory_log() -> None:
         Worker.execute_model = execute_model
         _say(
             f"prefill empty_cache hook armed (threshold {threshold} tokens, "
-            f"release when MemAvailable < {memavail_gib} GiB{' [always]' if memavail_gib <= 0 else ''}, "
+            f"release when {'cuda free' if mem_source == 'cuda' else 'MemAvailable'} < {memavail_gib} GiB{' [always]' if memavail_gib <= 0 else ''}, "
             f"prefill-end release {'on' if end_release else 'off'})"
         )
 

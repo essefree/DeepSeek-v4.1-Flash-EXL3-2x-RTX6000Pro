@@ -16,7 +16,10 @@ vLLM's MLA layout) but attention is ~3 GiB total, so the error is < 1 GiB.
 Prints a table and the per-rank total; ./start.sh uses the total for its
 pre-launch MemAvailable check.
 
-usage: weight_budget.py [--model DIR] [--tp N] [--json]
+usage: weight_budget.py [--model DIR] [--tp N] [--host-expert-layers SPEC] [--json]
+
+--host-expert-layers (e.g. "33-39", same syntax as DSV41_EXL3_HOST_EXPERT_LAYERS)
+moves those layers' routed experts out of the GPU total into a host total.
 """
 from __future__ import annotations
 
@@ -85,12 +88,35 @@ def classify(name: str) -> tuple[str, bool]:
     return "other", False
 
 
-def budget(model: Path, tp: int) -> dict:
+def parse_layer_spec(raw: str) -> set[int]:
+    out: set[int] = set()
+    for part in (raw or "").replace(" ", "").split(","):
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = (int(x) for x in part.split("-", 1))
+            out.update(range(lo, hi + 1))
+        else:
+            out.add(int(part))
+    return out
+
+
+def _expert_layer(name: str) -> int | None:
+    m = re.match(r"layers\.(\d+)\.ffn\.experts\.", name)
+    if m:
+        return int(m.group(1))
+    m = re.match(r"mtp\.(\d+)\.ffn\.experts\.", name)
+    return 40 + int(m.group(1)) if m else None  # vLLM numbers the DSpark draft 40-42
+
+
+def budget(model: Path, tp: int, host_layers: set[int] | None = None) -> dict:
     index = json.loads((model / "model.safetensors.index.json").read_text())
     wm = index["weight_map"]
     hdr = shard_headers(model, set(wm.values()))
     total = Counter()
     per_rank = Counter()
+    host_per_rank = 0
+    host_layers = host_layers or set()
     for name in wm:
         e = hdr.get(name)
         if e is None:
@@ -98,11 +124,15 @@ def budget(model: Path, tp: int) -> dict:
         b = nbytes(e)
         bucket, sharded = classify(name)
         total[bucket] += b
+        if _expert_layer(name) in host_layers and name.endswith(".trellis"):
+            host_per_rank += b // tp
+            continue
         per_rank[bucket] += b // tp if sharded else b
     return {
         "tp": tp,
         "total_bytes": sum(total.values()),
         "per_rank_bytes": sum(per_rank.values()),
+        "host_per_rank_bytes": host_per_rank,
         "buckets": {k: {"total": total[k], "per_rank": per_rank[k]} for k in sorted(total)},
     }
 
@@ -111,16 +141,19 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=str(Path(__file__).resolve().parents[1] / "model"))
     ap.add_argument("--tp", type=int, default=2)
+    ap.add_argument("--host-expert-layers", default="")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args()
-    r = budget(Path(a.model), a.tp)
+    r = budget(Path(a.model), a.tp, parse_layer_spec(a.host_expert_layers))
     if a.json:
         print(json.dumps(r))
         return 0
     print(f"{'bucket':16s} {'total GiB':>10s} {'per-rank GiB':>13s}")
     for k, v in r["buckets"].items():
         print(f"{k:16s} {v['total']/GIB:10.2f} {v['per_rank']/GIB:13.2f}")
-    print(f"{'TOTAL':16s} {r['total_bytes']/GIB:10.2f} {r['per_rank_bytes']/GIB:13.2f}   (TP={r['tp']})")
+    print(f"{'TOTAL':16s} {r['total_bytes']/GIB:10.2f} {r['per_rank_bytes']/GIB:13.2f}   (TP={r['tp']}, GPU-resident)")
+    if r["host_per_rank_bytes"]:
+        print(f"{'host experts':16s} {'':10s} {r['host_per_rank_bytes']/GIB:13.2f}   (pinned host RAM per rank)")
     return 0
 
 

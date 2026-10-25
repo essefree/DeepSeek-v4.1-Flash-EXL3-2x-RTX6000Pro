@@ -68,6 +68,7 @@ def _load_lib():
 def _load_cudart():
     paths = []
     paths += glob.glob("/usr/local/cuda*/targets/aarch64-linux/lib/libcudart.so*")
+    paths += glob.glob("/usr/local/cuda*/targets/x86_64-linux/lib/libcudart.so*")
     paths += glob.glob("/usr/local/cuda/lib64/libcudart.so*")
     paths += glob.glob(
         "/usr/local/lib/python*/dist-packages/nvidia/cuda_runtime/lib/libcudart.so*"

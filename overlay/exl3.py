@@ -741,6 +741,63 @@ def h2d_alloc(src: torch.Tensor, device: torch.device, dtype: torch.dtype | None
     return out
 
 
+# ----------------------------------------------------------------------------
+# Host-resident routed experts (discrete GPUs: 2x RTX PRO 6000 Blackwell).
+# At TP=2 this checkpoint needs 99.5 GiB per rank (scripts/weight_budget.py)
+# and a 96 GB card has 95.6 GiB, so the routed-expert trellis of the layers in
+# DSV41_EXL3_HOST_EXPERT_LAYERS (e.g. "33-39"; vLLM numbers the DSpark draft
+# layers 40-42) lives in pinned host RAM. The kernels read it in place over
+# PCIe through a UVA CUDA view (zero-copy, the same mechanism as vLLM's
+# --cpu-offload-gb), so the pointer tables and every apply path are unchanged.
+# Only the trellis moves; suh/svh/markers are a few MiB and stay on the GPU.
+# Each K=3 layer is ~2.38 GiB per rank (K=2 layers 18-22: ~1.59 GiB).
+# ----------------------------------------------------------------------------
+_HOST_EXPERTS = {"layers": [], "bytes": 0, "logged": False}
+
+
+def parse_layer_spec(raw: str) -> set[int]:
+    """'33-39' / '30,32,34-36' / '' -> set of layer indices."""
+    out: set[int] = set()
+    for part in (raw or "").replace(" ", "").split(","):
+        if not part:
+            continue
+        if "-" in part:
+            lo_s, hi_s = part.split("-", 1)
+            lo, hi = int(lo_s), int(hi_s)
+            if hi < lo:
+                raise ValueError(f"DSV41_EXL3_HOST_EXPERT_LAYERS: bad range {part!r}")
+            out.update(range(lo, hi + 1))
+        else:
+            out.add(int(part))
+    return out
+
+
+def host_expert_layers() -> set[int]:
+    return parse_layer_spec(os.environ.get("DSV41_EXL3_HOST_EXPERT_LAYERS", ""))
+
+
+def prefix_layer_index(prefix: str) -> int | None:
+    m = re.search(r"(?:layers|layer)[._](\d+)", prefix.replace("-", "."))
+    return int(m.group(1)) if m else None
+
+
+def _cuda_view_of_host(cpu: torch.Tensor) -> torch.Tensor:
+    try:
+        from vllm.utils.torch_utils import get_cuda_view_from_cpu_tensor
+    except ImportError:
+        try:
+            from vllm.utils import get_cuda_view_from_cpu_tensor  # type: ignore
+        except ImportError:
+            get_cuda_view_from_cpu_tensor = torch.ops._C.get_cuda_view_from_cpu_tensor
+    return get_cuda_view_from_cpu_tensor(cpu)
+
+
+def host_resident_empty(shape: tuple[int, ...], dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    """(pinned CPU backing, CUDA view of the same bytes)."""
+    cpu = torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+    return cpu, _cuda_view_of_host(cpu)
+
+
 def _narrow_tp(tensor: torch.Tensor, dim: int, tp_rank: int, tp_size: int) -> torch.Tensor:
     """This rank's slice as a view; h2d_copy handles the strides (one memcpy)."""
     if tp_size <= 1:
@@ -2192,14 +2249,32 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
         extra = {k: v for k, v in extra_weight_attrs.items() if k != "weight_loader"}
 
+        w13_shape = (num_experts, 2, in_tiles, out_tiles, k_words)
+        w2_shape = (num_experts, out_tiles, in_tiles, k_words)
+        layer_idx = prefix_layer_index(self.prefix)
+        on_host = layer_idx is not None and layer_idx in host_expert_layers()
+        if on_host:
+            w13_host, w13_data = host_resident_empty(w13_shape, torch.int16)
+            w2_host, w2_data = host_resident_empty(w2_shape, torch.int16)
+            layer._exl3_host_backing = (w13_host, w2_host)
+            nbytes = (w13_host.numel() + w2_host.numel()) * 2
+            _HOST_EXPERTS["layers"].append(layer_idx)
+            _HOST_EXPERTS["bytes"] += nbytes
+            logger.info(
+                "EXL3 routed experts of layer %s on host (pinned, UVA): %.2f GiB "
+                "(host total %.2f GiB over layers %s)",
+                layer_idx,
+                nbytes / 1024**3,
+                _HOST_EXPERTS["bytes"] / 1024**3,
+                sorted(_HOST_EXPERTS["layers"]),
+            )
+        else:
+            w13_data = torch.empty(w13_shape, dtype=torch.int16)
+            w2_data = torch.empty(w2_shape, dtype=torch.int16)
+
         # w13_* : stacked [expert, {gate=0, up=1}, ...] so the stock
         # expert_params_mapping (experts.w13_ + suffix) hits these names.
-        w13_trellis = Parameter(
-            torch.empty(
-                num_experts, 2, in_tiles, out_tiles, k_words, dtype=torch.int16
-            ),
-            requires_grad=False,
-        )
+        w13_trellis = Parameter(w13_data, requires_grad=False)
         w13_suh = Parameter(
             torch.empty(num_experts, 2, hidden_size, dtype=torch.float16),
             requires_grad=False,
@@ -2214,12 +2289,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             torch.empty(num_experts, 2, 1, dtype=torch.int32),
             requires_grad=False,
         )
-        w2_trellis = Parameter(
-            torch.empty(
-                num_experts, out_tiles, in_tiles, k_words, dtype=torch.int16
-            ),
-            requires_grad=False,
-        )
+        w2_trellis = Parameter(w2_data, requires_grad=False)
+        if on_host:
+            # The loader writes these through the CPU backing (plain memcpy from
+            # the shard mmap) instead of a DMA into the UVA view.
+            w13_trellis._exl3_host = w13_host
+            w2_trellis._exl3_host = w2_host
         w2_suh = Parameter(
             torch.empty(
                 num_experts, intermediate_size_per_partition, dtype=torch.float16
@@ -2292,13 +2367,16 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         suffix = _suffix_from_mapped_name(weight_name)
         loaded = loaded_weight.detach()  # keep the mmap view; h2d_copy stages it
 
+        store = getattr(param, "_exl3_host", None)
+        if store is None:
+            store = param.data
         if shard_id in ("w1", "w3"):
             shard_idx = 0 if shard_id == "w1" else 1
             sharded = shard_exl3_col(loaded, suffix, tp_rank, tp_size)
-            dest = param.data[expert_id, shard_idx]
+            dest = store[expert_id, shard_idx]
         elif shard_id == "w2":
             sharded = shard_exl3_row(loaded, suffix, tp_rank, tp_size)
-            dest = param.data[expert_id]
+            dest = store[expert_id]
         else:
             raise ValueError(f"unknown EXL3 shard_id={shard_id}")
 

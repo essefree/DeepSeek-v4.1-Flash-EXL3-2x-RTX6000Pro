@@ -68,4 +68,4 @@ have=$(find "$MODEL_HOST" -maxdepth 1 -name 'model-*.safetensors' 2>/dev/null | 
 for f in "${ENGRAM_FILES[@]}"; do
     [ -f "$ENGRAM_DIR/$f" ] || { echo "missing $ENGRAM_DIR/$f" >&2; exit 1; }
 done
-echo "complete. ./start.sh will NFS-share both trees to the worker (WEIGHT_SYNC=nfs)."
+echo "complete. ./start.sh serves both trees from this host."

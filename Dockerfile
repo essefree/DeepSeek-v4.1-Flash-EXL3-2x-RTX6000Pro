@@ -1,25 +1,29 @@
-# DeepSeek-V4.1-Flash EXL3 on SM121 (NVIDIA GB10 / DGX Spark).
+# DeepSeek-V4.1-Flash EXL3 on SM120 (2x NVIDIA RTX PRO 6000 Blackwell, x86_64).
+#
+# Fork of the 2x DGX Spark (GB10/SM121, aarch64) recipe. Differences:
+#   * amd64 base (same vLLM build, the deepseekv41-flash-0909 tag is multi-arch)
+#   * kernels compiled for sm_120a instead of sm_121a
+#   * no aarch64 AVX stubs: x86 builds exllamav3's CPU targets as upstream does
 #
 # Base image is the official DeepSeek-V4.1-Flash vLLM build (DSpark, CSA2, Engram).
 # We do NOT use the GLM-5.3-Flash glm53-flash-arm64-cu130 image: that tree has
 # no DeepseekV41 architecture. GLM NoPE-MLA padding patches do not apply here.
 #
 # This overlay adds:
-#   * native SM121 exllamav3_ext (fused exl3_moe + fat kernels compiled in)
+#   * native SM120 exllamav3_ext (fused exl3_moe + fat kernels compiled in)
 #   * packed EXL3 mul1 loader (mixed K, experts + linears)
-#   * operational GB10 patches (stops-in-reasoning, decode floor, spinwait,
+#   * operational patches from the Spark recipe (stops-in-reasoning, decode floor, spinwait,
 #     xgrammar) that are model-agnostic
 #
 # E2 fat kernels are K4/MCG-only (unused here); the E3 v2 grouped kernels below cover mul1 K2/K3/K4.
 # selects them. Fused exl3_moe is the decode path.
 #
-# Build (context = repo root, aarch64 host):
+# Build (context = repo root, x86_64 host):
 #   docker build -t dsv41-flash-exl3:local .
 
-ARG BASE=vllm/vllm-openai:deepseekv41-flash-0909
+ARG BASE=vllm/vllm-openai:deepseekv41-flash-0909-amd64
 FROM ${BASE}
 
-COPY overlay/patch_exl3_ext_aarch64.py /opt/dsv41/patch_exl3_ext_aarch64.py
 COPY overlay/patch_exl3_fat_kernel.py /opt/dsv41/patch_exl3_fat_kernel.py
 COPY overlay/exl3_fat_gemm.cu /opt/dsv41/exl3-fat-kernel/exl3_fat_gemm.cu
 COPY overlay/exl3_fat_gemm.cuh /opt/dsv41/exl3-fat-kernel/exl3_fat_gemm.cuh
@@ -34,9 +38,10 @@ COPY overlay/build_exl3_fat_moe_ext.py /opt/dsv41/build_exl3_fat_moe_ext.py
 # v0.0.43 fused exl3_moe TORCH_CHECKs mcg-only. This checkpoint is mul1.
 # v1.4.5 instantiates cb1 (mcg) and cb2 (mul1) fused MoE kernels.
 ARG EXLLAMAV3_COMMIT=e648f1a131365aae15920073e761a3fa5a527654
-ENV TORCH_CUDA_ARCH_LIST=12.1a
-ENV FLASHINFER_CUDA_ARCH_LIST=12.1a
-ENV MAX_JOBS=8
+ENV TORCH_CUDA_ARCH_LIST=12.0a
+ENV FLASHINFER_CUDA_ARCH_LIST=12.0a
+ARG MAX_JOBS=16
+ENV MAX_JOBS=${MAX_JOBS}
 ENV CUDA_HOME=/usr/local/cuda
 ENV PATH=/usr/local/cuda/bin:${PATH}
 
@@ -82,8 +87,8 @@ else:
 PY
 
 # The vLLM image keeps CUDA toolkit headers under nvidia/cu13, not
-# /usr/local/cuda/include. ExLlamaV3 ships AVX2/AVX512 CPU targets that
-# do not compile on aarch64; stub them so the SM121 GEMM still builds.
+# /usr/local/cuda/include (harmless if this amd64 image also has them in
+# /usr/local/cuda). On x86_64 ExLlamaV3's AVX2/AVX512 CPU targets build as-is.
 # After pip install, import torch before exllamav3_ext so libc10.so is
 # already mapped (this image does not set LD_LIBRARY_PATH during build).
 RUN set -eux; \
@@ -91,14 +96,13 @@ RUN set -eux; \
     curl -fsSL "https://github.com/turboderp-org/exllamav3/archive/${EXLLAMAV3_COMMIT}.tar.gz" \
       | tar -xz -C /tmp/exllamav3 --strip-components=1; \
     python3 -c "from pathlib import Path; assert (Path('/tmp/exllamav3')/'exllamav3/modules/quant/exl3.py').is_file()"; \
-    python3 /opt/dsv41/patch_exl3_ext_aarch64.py /tmp/exllamav3/exllamav3/exllamav3_ext; \
     python3 /opt/dsv41/patch_exl3_fat_kernel.py /tmp/exllamav3/exllamav3/exllamav3_ext /opt/dsv41/exl3-fat-kernel; \
     PY_SITE="$(python3 -c 'import site; print(site.getsitepackages()[0])')"; \
     export CPATH="${PY_SITE}/nvidia/cu13/include${CPATH:+:$CPATH}"; \
     export CPLUS_INCLUDE_PATH="${PY_SITE}/nvidia/cu13/include${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}"; \
     export C_INCLUDE_PATH="${PY_SITE}/nvidia/cu13/include${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"; \
     cd /tmp/exllamav3; \
-    TORCH_CUDA_ARCH_LIST=12.1a MAX_JOBS=8 \
+    TORCH_CUDA_ARCH_LIST=12.0a MAX_JOBS=${MAX_JOBS} \
       pip install --no-deps --no-build-isolation --no-cache-dir .; \
     python3 -c "import torch; import exllamav3_ext; assert hasattr(exllamav3_ext, 'exl3_moe'), dir(exllamav3_ext); assert hasattr(exllamav3_ext, 'exl3_fat_gemm'); print('exllamav3_ext', exllamav3_ext.__file__, 'exl3_moe=yes fat_gemm=yes')"; \
     rm -rf /tmp/exllamav3 /root/.cache/pip
@@ -108,7 +112,7 @@ RUN set -eux; \
 # overlay once this module (abi 2) is importable.
 RUN set -eux; \
     PY_SITE="$(python3 -c 'import site; print(site.getsitepackages()[0])')"; \
-    python3 /opt/dsv41/build_exl3_fat_moe_ext.py --src /opt/dsv41/e3v2 --out /tmp/e3v2 --arch 121a --install "$PY_SITE"; \
+    python3 /opt/dsv41/build_exl3_fat_moe_ext.py --src /opt/dsv41/e3v2 --out /tmp/e3v2 --arch 120a --install "$PY_SITE"; \
     python3 -c "import torch, exl3_fat_moe_ext as m; assert int(m.exl3_fat_moe_abi()) == 2; print('exl3_fat_moe_ext abi', int(m.exl3_fat_moe_abi()))"; \
     rm -rf /tmp/e3v2
 
@@ -129,6 +133,7 @@ COPY overlay/patch_spinwait.py /opt/dsv41/patch_spinwait.py
 COPY overlay/patch_memory_log.py /opt/dsv41/patch_memory_log.py
 COPY overlay/patch_h2d_stage.py /opt/dsv41/patch_h2d_stage.py
 COPY overlay/patch_sm120_block64.py /opt/dsv41/patch_sm120_block64.py
+COPY overlay/patch_responses_content_types.py /opt/dsv41/patch_responses_content_types.py
 COPY files/chat_template.jinja /opt/dsv41/chat_template.jinja
 COPY files/exl3_k_map.json /opt/dsv41/exl3_k_map.json
 COPY tests/test_exl3_overlay.py /opt/dsv41/test_exl3_overlay.py
@@ -145,6 +150,7 @@ COPY tests/test_h2d_stage.py /opt/dsv41/test_h2d_stage.py
 COPY tests/test_sm120_block64.py /opt/dsv41/test_sm120_block64.py
 COPY tests/test_exl3_pretune.py /opt/dsv41/test_exl3_pretune.py
 COPY tests/test_engram_dequant.py /opt/dsv41/test_engram_dequant.py
+COPY tests/test_host_experts.py /opt/dsv41/test_host_experts.py
 COPY scripts/pack_engram.py /opt/dsv41/pack_engram.py
 COPY scripts/boot-shape-warmup.sh /opt/dsv41/boot-shape-warmup.sh
 COPY scripts/pyspy_dump.sh /opt/dsv41/pyspy_dump.sh
@@ -187,13 +193,13 @@ RUN EXL3_SELFCHECK_GPU=0 python3 /opt/dsv41/test_exl3_overlay.py \
     && python3 /opt/dsv41/test_h2d_stage.py \
     && python3 /opt/dsv41/test_sm120_block64.py \
     && EXL3_SELFCHECK_GPU=0 python3 /opt/dsv41/test_exl3_pretune.py \
-    && python3 /opt/dsv41/test_engram_dequant.py
+    && python3 /opt/dsv41/test_engram_dequant.py \
+    && EXL3_SELFCHECK_GPU=0 python3 /opt/dsv41/test_host_experts.py
 RUN python3 /opt/dsv41/test_xgrammar_termination.py \
     || echo "WARN: xgrammar test skipped (patch may already be upstream)"
 
 ARG DSV41_RECIPE_STAMP=unknown
 LABEL dsv41.recipe.stamp=${DSV41_RECIPE_STAMP}
 # Attaches the GHCR package to the repo (GitHub reads image.source).
-LABEL org.opencontainers.image.source="https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-EXL3-2x-DGX-Sparks" \
-      org.opencontainers.image.description="DeepSeek-V4.1-Flash EXL3 2.9bpw on 2x DGX Spark (GB10/SM121), vLLM + exllamav3 overlay" \
+LABEL org.opencontainers.image.description="DeepSeek-V4.1-Flash EXL3 2.9bpw on 2x RTX PRO 6000 Blackwell (SM120, x86_64), vLLM + exllamav3 overlay (fork of MiaAI-Lab/DeepSeek-v4.1-Flash-EXL3-2x-DGX-Sparks)" \
       org.opencontainers.image.licenses="AGPL-3.0"

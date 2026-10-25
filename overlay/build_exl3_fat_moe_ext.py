@@ -7,7 +7,7 @@ hadamard_inner.cuh, ...) resolve exactly as they would in a full
 patch_exl3_fat_kernel.py image build. This is the layered-image path: it
 does not recompile exllamav3_ext.
 
-Flags: -O3 -lineinfo, sm_121a. Deliberately WITHOUT --use_fast_math (which
+Flags: -O3 -lineinfo, sm_<arch> (121a on GB10, 120a on RTX PRO 6000). Deliberately WITHOUT --use_fast_math (which
 exllamav3's setup.py uses): the gate/up epilogue must reproduce torch.sigmoid's
 full-precision expf/division to keep the E2 rounding boundaries.
 
