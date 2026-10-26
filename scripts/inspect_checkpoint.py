@@ -6,6 +6,9 @@ actual tensors in the shards with Mia-AiLab's 2.9bpw layout and the bundled
 files/exl3_k_map.json, and reports anything the overlay will not load as-is.
 
 usage: inspect_checkpoint.py /path/to/checkpoint [--kmap files/exl3_k_map.json]
+       inspect_checkpoint.py --native-linears /path/to/checkpoint
+         prints the checkpoint names of linears stored as a plain .weight instead
+         of a trellis, comma-separated (start.sh passes them as DSV41_NATIVE_LINEARS)
 """
 from __future__ import annotations
 
@@ -35,11 +38,49 @@ def headers(model: Path) -> dict[str, dict]:
     return out
 
 
+# Linears the overlay would otherwise build as EXL3 (attention, shared experts).
+LINEAR_RE = re.compile(
+    r"^layers\.\d+\.(attn\.(wq_a|wq_b|wkv|wo_a(\.slice\.\d+)?|wo_b|indexer\.(wq_b|wk)|compressor\.(wkv|wgate))"
+    r"|ffn\.shared_experts\.w[123])$"
+)
+
+
+def engram_files(h: dict[str, dict]) -> set[str]:
+    return {v["file"] for k, v in h.items() if ".engram.embed." in k}
+
+
+def native_linears(h: dict[str, dict]) -> tuple[list[str], list[str]]:
+    """(plain-.weight linears with no trellis, ones that cannot load that way)."""
+    skip = engram_files(h)  # served by the Engram backend, hidden from vLLM
+    live = {k: v for k, v in h.items() if v["file"] not in skip}
+    packed = {k.rsplit(".", 1)[0] for k in live if k.endswith(".trellis")}
+    names, bad = [], []
+    for k, v in sorted(live.items()):
+        if not k.endswith(".weight"):
+            continue
+        mod = k[: -len(".weight")]
+        if mod in packed or not LINEAR_RE.match(mod):
+            continue
+        if v["dtype"].startswith("F8") or (mod + ".scale") in live:
+            bad.append(f"{mod} ({v['dtype']}{' + block scale' if (mod + '.scale') in live else ''})")
+        else:
+            names.append(mod)
+    return names, bad
+
+
 def norm(name: str) -> str:
     return re.sub(r"\.\d+\.", ".N.", name)
 
 
 def main() -> int:
+    if len(sys.argv) >= 2 and sys.argv[1] == "--native-linears":
+        h = headers(Path(sys.argv[2]).expanduser())
+        names, bad = native_linears(h)
+        if bad:
+            print("unsupported native linears (fp8 / block-scaled): " + ", ".join(bad[:5]), file=sys.stderr)
+            return 3
+        print(",".join(names))
+        return 0
     ap = argparse.ArgumentParser()
     ap.add_argument("model")
     ap.add_argument("--kmap", default=str(ROOT / "files" / "exl3_k_map.json"))
@@ -80,29 +121,24 @@ def main() -> int:
         if stray:
             notes.append(f"{len(stray)} tensors are in shards but not in the index, e.g. {stray[:3]}")
 
-    # 1. Native (unquantized) linears where the overlay expects trellis.
-    packed_mods = {k.rsplit(".", 1)[0] for k in h if k.rsplit(".", 1)[-1] in PACKED_SUFFIXES}
-    native = collections.defaultdict(list)
-    for k, v in h.items():
-        if "." not in k:
-            continue
-        mod, suf = k.rsplit(".", 1)
-        if suf == "weight" and (".attn.wo_b" in k or ".shared_experts." in k or ".engram.wkv" in k):
-            native[norm(mod)].append((k, v["dtype"], v["file"], mod in packed_mods))
-    for mod, rows in sorted(native.items()):
-        both = sum(r[3] for r in rows)
-        dt = sorted({r[1] for r in rows})
-        files = sorted({r[2] for r in rows})
-        layers = sorted({int(m.group(1)) for r in rows if (m := re.search(r"layers\.(\d+)\.", r[0]))})
-        if "engram.wkv" in mod and all(f.endswith("-of-00048.safetensors") for f in files):
-            notes.append(f"{mod}: native {dt} copy from the original Engram shards {files} "
-                         f"({'trellis copy also present' if both else 'NO trellis copy'})")
-            if not both:
-                problems.append(f"{mod} exists only as native {dt}; the overlay loads Engram wkv as EXL3")
-        else:
-            problems.append(f"{mod}: {len(rows)} native {dt} tensors in layers {layers} "
-                            f"({'both native and trellis' if both else 'no trellis'}) — the overlay builds "
-                            "these as EXL3 linears; needs a native-linear exception")
+    # 1. Linears stored as a plain .weight (the Engram shards are hidden from vLLM).
+    names, bad = native_linears(h)
+    if names:
+        by = collections.defaultdict(list)
+        for n in names:
+            by[norm(n)].append(int(re.search(r"layers\.(\d+)\.", n).group(1)))
+        size = sum(h[n + ".weight"]["data_offsets"][1] - h[n + ".weight"]["data_offsets"][0] for n in names)
+        for mod, layers in sorted(by.items()):
+            notes.append(f"{mod}: unquantized in layers {sorted(layers)} — loaded as plain linears "
+                         f"(start.sh sets DSV41_NATIVE_LINEARS automatically)")
+        notes.append(f"unquantized linears total {size / 2**30:.2f} GiB (≈ this much extra VRAM over all ranks "
+                     "vs EXL3; scripts/weight_budget.py includes it)")
+    for b in bad:
+        problems.append(f"{b}: native fp8 / block-scaled linear — the plain-linear path cannot apply the scales")
+    stray_wkv = [k for k, v in h.items() if k.endswith(".engram.wkv.weight") and v["file"] in engram_files(h)]
+    if stray_wkv:
+        notes.append(f"native Engram wkv copies in the stock Engram shards ({len(stray_wkv)}) are ignored: "
+                     "those shards are hidden from the model loader")
 
     # 2. Engram tables bundled in the model directory.
     eng = sorted({v["file"] for k, v in h.items() if ".engram.embed." in k})

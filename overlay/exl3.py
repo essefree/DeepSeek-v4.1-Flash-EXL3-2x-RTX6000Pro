@@ -2063,12 +2063,40 @@ class Exl3Config(QuantizationConfig):
         return None
 
 
+# Linears a checkpoint stores as a plain .weight instead of a trellis (e.g. an
+# edited wo_b). start.sh reads the shard headers and passes their checkpoint
+# names ("layers.10.attn.wo_b,layers.10.ffn.shared_experts.w2,...") here; vLLM
+# then builds them with its unquantized method.
+_NATIVE_ALIASES = {"shared_experts.down_proj": "shared_experts.w2"}
+
+
+def native_linear_names() -> set[str]:
+    raw = os.environ.get("DSV41_NATIVE_LINEARS", "")
+    return {x.strip() for x in raw.split(",") if x.strip()}
+
+
+def checkpoint_linear_name(prefix: str) -> str | None:
+    """vLLM module prefix -> checkpoint module name ("layers.N.<tail>")."""
+    m = re.search(r"(?:^|\.)layers\.(\d+)\.(.+)$", prefix.replace("-", "."))
+    if not m:
+        return None
+    tail = m.group(2)
+    for vllm_tail, ckpt_tail in _NATIVE_ALIASES.items():
+        if tail.endswith(vllm_tail):
+            tail = tail[: -len(vllm_tail)] + ckpt_tail
+    return f"layers.{m.group(1)}.{tail}"
+
+
 def _skip_exl3_linear(prefix: str) -> bool:
-    """Native (not packed) linears: vision, router, MTP markov head, indexer proj.
+    """Native (not packed) linears: vision, router, MTP markov head, indexer proj,
+    and whatever DSV41_NATIVE_LINEARS lists for this checkpoint.
 
     The main `lm_head` is packed EXL3 (head_bits=6). ParallelLMHead is dispatched
     in get_quant_method before this skip list.
     """
+    native = native_linear_names()
+    if native and checkpoint_linear_name(prefix) in native:
+        return True
     p = prefix.replace("-", ".").lower()
     if any(
         x in p

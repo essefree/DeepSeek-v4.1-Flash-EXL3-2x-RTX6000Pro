@@ -388,6 +388,19 @@ print(f"[dsv41-exl3] model view {dst}: hides {sorted(eng)} ({len(wm) - len(keep)
 PY
 }
 
+# Linears the checkpoint stores as a plain .weight instead of a trellis (read
+# from the shard headers, not the index): the overlay loads those unquantized.
+DSV41_NATIVE_LINEARS="${DSV41_NATIVE_LINEARS-}"
+detect_native_linears() {
+    local out rc=0
+    out="$(python3 "$SCRIPT_DIR/scripts/inspect_checkpoint.py" --native-linears "$MODEL_HOST")" || rc=$?
+    [ "$rc" = "0" ] || die "checkpoint has linears this recipe cannot load (see above); run python3 scripts/inspect_checkpoint.py $MODEL_HOST"
+    DSV41_NATIVE_LINEARS="$out"
+    if [ -n "$out" ]; then
+        log "unquantized linears in the checkpoint: $(printf '%s' "$out" | awk -F, '{print NF}') (e.g. ${out%%,*}) — loaded as plain linears"
+    fi
+}
+
 # Directories that hold the real files behind the symlinks in $1.
 link_target_dirs() {
     find "$1" -maxdepth 1 -type l -exec readlink -f {} \; 2>/dev/null | xargs -r -n1 dirname | sort -u
@@ -642,6 +655,7 @@ preflight() {
     [ -f "$KMAP_HOST" ] || die "K map $KMAP_HOST missing"
     log "K map: ${KMAP_HOST}"
     check_model_config
+    detect_native_linears
 
     [ -f "$MODEL_HOST/config.json" ] || die "EXL3 checkpoint missing config.json at $MODEL_HOST"
     local have
@@ -764,7 +778,7 @@ launch() {
              KV_CACHE_MEMORY_BYTES KV_BLOCK_SIZE DSV41_SKIP_MIXED_WARMUP DSV41_DROP_PAGE_CACHE \
              DSV41_MEM_SOURCE DSV41_PREFILL_EMPTY_CACHE_TOKENS DSV41_PREFILL_EMPTY_CACHE_MEMAVAIL_GIB \
              DSV41_PREFILL_END_EMPTY_CACHE VLLM_SPARSE_INDEXER_MAX_LOGITS_MB DSV41_INDEXER_PREFILL_FACTOR \
-             DSV41_EXL3_HOST_EXPERT_LAYERS DSV41_EXL3_SERIAL_STREAMS DSV41_ENGRAM_DISABLE \
+             DSV41_EXL3_HOST_EXPERT_LAYERS DSV41_NATIVE_LINEARS DSV41_EXL3_SERIAL_STREAMS DSV41_ENGRAM_DISABLE \
              VLLM_DISABLE_SHARED_EXPERTS_STREAM DISABLE_CUSTOM_ALL_REDUCE CUDA_LAUNCH_BLOCKING \
              NCCL_DEBUG NCCL_DEBUG_SUBSYS NCCL_P2P_DISABLE \
              GLM53_SUPPRESS_STOPS_IN_REASONING GLM53_MIXED_PREFILL_CHUNK GLM53_INDEXER_WORKSPACE \
