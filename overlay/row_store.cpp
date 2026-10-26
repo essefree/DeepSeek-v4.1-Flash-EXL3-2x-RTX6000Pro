@@ -1,4 +1,7 @@
-// Exact immutable FP8 row retrieval; bounded set-associative RAM cache.
+// Exact immutable Engram row retrieval; bounded set-associative RAM cache.
+// Row format is per store (row_store_open2): stock fp8 e4m3 rows (256 B) with
+// ue8m0 scales (8 B), or diffbot's int4 rows (128 B packed) with fp16 scales
+// (16 B). The store only moves bytes; the GPU dequant kernel knows the format.
 // No CUDA calls in the callback: suitable for cudaLaunchHostFunc graph nodes.
 //
 // The callback blocks the compute stream, so every microsecond spent here is a
@@ -26,9 +29,7 @@
 
 namespace {
 
-constexpr uint64_t kRowBytes = 264;   // 256 B weight + 8 B scale
-constexpr uint64_t kWeightBytes = 256;
-constexpr uint64_t kScaleBytes = 8;
+constexpr uint64_t kMaxRowBytes = 264;   // largest supported: 256 B fp8 weight + 8 B scale
 constexpr uint64_t kPage = 4096;
 constexpr uint64_t kPackedHeader = 4096;   // keeps row 0 page-aligned
 constexpr uint64_t kPackedMagic = 0x31344e4531565344ULL;  // "DSV41EN1"
@@ -60,6 +61,7 @@ bool env_flag(const char *name, bool fallback) {
 struct Store {
   int fd;
   uint64_t rows, weight_offset, scale_offset, slots, row_lo, row_hi;
+  uint64_t weight_bytes = 256, scale_bytes = 8, row_bytes = 264;
   uint64_t sets = 0, ways = 1;
   uint8_t *cache = nullptr;
   uint64_t *keys = nullptr;
@@ -105,7 +107,7 @@ static void read_bytes(Store *s, uint64_t offset, uint8_t *out, size_t length) {
   read_from(s, s->fd, offset, out, length);
 }
 
-// Fetch one owned row into `row` (264 B), consulting and filling the cache.
+// Fetch one owned row into `row` (row_bytes), consulting and filling the cache.
 static void fetch_row(Store *s, uint64_t id, uint8_t *row) {
   const uint64_t set = s->sets ? id % s->sets : 0;
   std::mutex &lock = s->locks[set % 256];
@@ -114,7 +116,7 @@ static void fetch_row(Store *s, uint64_t id, uint8_t *row) {
     const uint64_t base = set * s->ways;
     for (uint64_t w = 0; w < s->ways; ++w) {
       if (s->keys[base + w] == id + 1) {
-        std::memcpy(row, s->cache + (base + w) * kRowBytes, kRowBytes);
+        std::memcpy(row, s->cache + (base + w) * s->row_bytes, s->row_bytes);
         s->hits.fetch_add(1, std::memory_order_relaxed);
         return;
       }
@@ -124,15 +126,16 @@ static void fetch_row(Store *s, uint64_t id, uint8_t *row) {
   if (s->packed_fd >= 0) {
     // Weight and scale are adjacent here, so the whole row is one read -- and on
     // a worker it is a local read instead of an NFS round trip to the head.
-    read_from(s, s->packed_fd, kPackedHeader + (id - s->row_lo) * kRowBytes,
-              row, kRowBytes);
+    read_from(s, s->packed_fd, kPackedHeader + (id - s->row_lo) * s->row_bytes,
+              row, s->row_bytes);
   } else {
-    read_bytes(s, s->weight_offset + id * kWeightBytes, row, kWeightBytes);
+    read_bytes(s, s->weight_offset + id * s->weight_bytes, row, s->weight_bytes);
     if (s->scales) {
-      std::memcpy(row + kWeightBytes, s->scales + (id - s->row_lo) * kScaleBytes,
-                  kScaleBytes);
+      std::memcpy(row + s->weight_bytes, s->scales + (id - s->row_lo) * s->scale_bytes,
+                  s->scale_bytes);
     } else {
-      read_bytes(s, s->scale_offset + id * kScaleBytes, row + kWeightBytes, kScaleBytes);
+      read_bytes(s, s->scale_offset + id * s->scale_bytes, row + s->weight_bytes,
+                 s->scale_bytes);
     }
   }
   s->misses.fetch_add(1, std::memory_order_relaxed);
@@ -141,31 +144,32 @@ static void fetch_row(Store *s, uint64_t id, uint8_t *row) {
     const uint64_t base = set * s->ways;
     const uint64_t w = s->victim[set] % s->ways;
     s->victim[set] = uint8_t((s->victim[set] + 1) % s->ways);
-    std::memcpy(s->cache + (base + w) * kRowBytes, row, kRowBytes);
+    std::memcpy(s->cache + (base + w) * s->row_bytes, row, s->row_bytes);
     s->keys[base + w] = id + 1;
   }
 }
 
 static void serve(Work *work, uint64_t begin, uint64_t end) {
   Store *s = work->store;
+  const uint64_t wb = s->weight_bytes, sb = s->scale_bytes;
   for (uint64_t i = begin; i < end; ++i) {
     const int64_t id = work->ids[i];
     // vLLM uses DEAD_ID=-1 for tokens that skip n-gram lookup (image spans).
     if (id < 0) {
-      std::memset(work->weights + i * kWeightBytes, 0, kWeightBytes);
-      std::memset(work->scales + i * kScaleBytes, 0, kScaleBytes);
+      std::memset(work->weights + i * wb, 0, wb);
+      std::memset(work->scales + i * sb, 0, sb);
       continue;
     }
     if (uint64_t(id) >= s->rows) fail("row ID out of bounds");
     if (uint64_t(id) < s->row_lo || uint64_t(id) >= s->row_hi) {
-      std::memset(work->weights + i * kWeightBytes, 0, kWeightBytes);
-      std::memset(work->scales + i * kScaleBytes, 0, kScaleBytes);
+      std::memset(work->weights + i * wb, 0, wb);
+      std::memset(work->scales + i * sb, 0, sb);
       continue;
     }
-    uint8_t row[kRowBytes];
+    uint8_t row[kMaxRowBytes];
     fetch_row(s, uint64_t(id), row);
-    std::memcpy(work->weights + i * kWeightBytes, row, kWeightBytes);
-    std::memcpy(work->scales + i * kScaleBytes, row + kWeightBytes, kScaleBytes);
+    std::memcpy(work->weights + i * wb, row, wb);
+    std::memcpy(work->scales + i * sb, row + wb, sb);
   }
 }
 
@@ -275,12 +279,12 @@ Pool *pool() {
 bool pin_scales(Store *s) {
   const uint64_t count = s->row_hi - s->row_lo;
   if (!count) return false;
-  const uint64_t bytes = count * kScaleBytes;
+  const uint64_t bytes = count * s->scale_bytes;
   void *map = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (map == MAP_FAILED) return false;
   auto *out = static_cast<uint8_t *>(map);
-  const uint64_t start = s->scale_offset + s->row_lo * kScaleBytes;
+  const uint64_t start = s->scale_offset + s->row_lo * s->scale_bytes;
   const uint64_t end = start + bytes;
   if (s->resident) {
     std::memcpy(out, s->resident + start, bytes);
@@ -312,9 +316,16 @@ bool pin_scales(Store *s) {
 
 }  // namespace
 
-extern "C" Store *row_store_open(const char *path, uint64_t rows,
-                                 uint64_t woff, uint64_t soff, uint64_t budget) {
+// weight_bytes/scale_bytes: 256/8 for stock fp8+ue8m0 rows, 128/16 for int4+fp16.
+extern "C" Store *row_store_open2(const char *path, uint64_t rows,
+                                  uint64_t woff, uint64_t soff, uint64_t budget,
+                                  uint64_t weight_bytes, uint64_t scale_bytes) {
+  if (!weight_bytes || !scale_bytes || weight_bytes + scale_bytes > kMaxRowBytes)
+    fail("unsupported Engram row format");
   auto *s = new Store;
+  s->weight_bytes = weight_bytes;
+  s->scale_bytes = scale_bytes;
+  s->row_bytes = weight_bytes + scale_bytes;
   const char *mode = std::getenv("OFFLOAD_MODE");
   const bool ram = mode && std::strcmp(mode, "ram") == 0;
   s->fd = open(path, O_RDONLY | O_CLOEXEC | (ram ? 0 : O_DIRECT));
@@ -330,8 +341,9 @@ extern "C" Store *row_store_open(const char *path, uint64_t rows,
   if (s->fd < 0) { delete s; return nullptr; }
   struct stat statbuf;
   if (fstat(s->fd, &statbuf) || woff > uint64_t(statbuf.st_size) ||
-      soff > uint64_t(statbuf.st_size) || rows > (uint64_t(statbuf.st_size)-woff)/256 ||
-      rows > (uint64_t(statbuf.st_size)-soff)/8) fail("invalid table extent");
+      soff > uint64_t(statbuf.st_size) ||
+      rows > (uint64_t(statbuf.st_size)-woff)/s->weight_bytes ||
+      rows > (uint64_t(statbuf.st_size)-soff)/s->scale_bytes) fail("invalid table extent");
   if (ram) {
     s->resident_size = statbuf.st_size;
     s->resident = static_cast<uint8_t *>(mmap(nullptr,s->resident_size,
@@ -343,10 +355,10 @@ extern "C" Store *row_store_open(const char *path, uint64_t rows,
   s->rows = rows; s->weight_offset = woff; s->scale_offset = soff;
   s->row_lo = 0; s->row_hi = rows;
   s->ways = std::max<uint64_t>(1, std::min<uint64_t>(16, env_u64("DSV41_CACHE_WAYS", 4)));
-  s->sets = budget / ((kRowBytes + sizeof(uint64_t)) * s->ways + 1);
+  s->sets = budget / ((s->row_bytes + sizeof(uint64_t)) * s->ways + 1);
   s->slots = s->sets * s->ways;
   if (s->slots) {
-    s->cache = static_cast<uint8_t *>(mmap(nullptr, s->slots * kRowBytes,
+    s->cache = static_cast<uint8_t *>(mmap(nullptr, s->slots * s->row_bytes,
         PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     s->keys = static_cast<uint64_t *>(mmap(nullptr, s->slots * sizeof(uint64_t),
         PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
@@ -356,6 +368,12 @@ extern "C" Store *row_store_open(const char *path, uint64_t rows,
       fail("cache allocation");
   }
   return s;
+}
+
+// Stock fp8 layout (kept for callers that predate row_store_open2).
+extern "C" Store *row_store_open(const char *path, uint64_t rows,
+                                 uint64_t woff, uint64_t soff, uint64_t budget) {
+  return row_store_open2(path, rows, woff, soff, budget, 256, 8);
 }
 
 extern "C" void row_store_lookup(void *opaque) {
@@ -370,7 +388,7 @@ extern "C" void row_store_lookup(void *opaque) {
 
 extern "C" void row_store_stats(Store *s, uint64_t *out) {
   out[0] = s->hits.load(); out[1] = s->misses.load(); out[2] = s->reads.load();
-  out[3] = s->slots * (kRowBytes + sizeof(uint64_t)) + s->sets;
+  out[3] = s->slots * (s->row_bytes + sizeof(uint64_t)) + s->sets;
   out[4] = s->slots;
   out[5] = s->scales_size;
   out[6] = s->ways;
@@ -397,7 +415,7 @@ extern "C" int row_store_attach_packed(Store *s, const char *path, uint64_t laye
   std::memcpy(&rows, header + 32, 8);
   std::memcpy(&row_bytes, header + 40, 8);
   if (magic != kPackedMagic || layer != layer_id || lo != s->row_lo ||
-      hi != s->row_hi || rows != s->rows || row_bytes != kRowBytes) {
+      hi != s->row_hi || rows != s->rows || row_bytes != s->row_bytes) {
     std::fprintf(stderr,
         "Engram: packed shard %s does not match this rank "
         "(layer=%llu lo=%llu hi=%llu); ignoring, using checkpoint\n",
@@ -410,7 +428,7 @@ extern "C" int row_store_attach_packed(Store *s, const char *path, uint64_t laye
   }
   struct stat statbuf;
   if (fstat(fd, &statbuf) ||
-      uint64_t(statbuf.st_size) < kPackedHeader + (hi - lo) * kRowBytes)
+      uint64_t(statbuf.st_size) < kPackedHeader + (hi - lo) * s->row_bytes)
     fail("packed Engram shard is truncated");
   s->packed_fd = fd;
   return 1;
@@ -436,7 +454,7 @@ extern "C" void row_store_close(Store *s) {
   if (s->resident) munmap(s->resident,s->resident_size);
   if (s->scales) munmap(s->scales, s->scales_size);
   if (s->slots) {
-    munmap(s->cache, s->slots * kRowBytes);
+    munmap(s->cache, s->slots * s->row_bytes);
     munmap(s->keys, s->slots * sizeof(uint64_t));
     munmap(s->victim, s->sets);
   }

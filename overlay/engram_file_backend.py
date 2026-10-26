@@ -1,4 +1,4 @@
-"""File-backed Engram tables for 2× Spark UMA.
+"""File-backed Engram tables (row_store + GPU dequant), fp8 or int4 rows.
 
 vLLM's stock ParallelEngramEmbedding pins this rank's hash heads
 (~47 GiB × 2 layers) with cudaHostAlloc. On GB10 that is the same pool as
@@ -7,6 +7,11 @@ GPU memory, so layer 14's torch.empty dies after layer 1 succeeds.
 This replacement keeps dummy 0-size parameters (so load_weights does not
 expect a 95 GiB copy), opens the native safetensors via row_store, and
 gathers rows through cudaLaunchHostFunc so CUDA graphs still work.
+
+Row format (engram_format.py) is read from the shard header: stock fp8 e4m3
+rows with ue8m0 scales (264 B/row) or diffbot's int4 rows with fp16 scales
+(144 B/row). Each gets its own Triton dequant kernel; everything else is
+byte-count arithmetic.
 """
 from __future__ import annotations
 
@@ -16,11 +21,18 @@ import json
 import logging
 import os
 from pathlib import Path
-import struct
 import threading
+
+import sys
 
 import torch
 from torch import nn
+
+for _d in (Path("/opt/dsv41"), Path(__file__).resolve().parent):
+    if (_d / "engram_format.py").is_file() and str(_d) not in sys.path:
+        sys.path.insert(0, str(_d))
+        break
+import engram_format  # noqa: E402
 
 P, U = C.c_void_p, C.c_uint64
 _LIB_CANDIDATES = (
@@ -57,6 +69,8 @@ def _load_lib():
     lib = C.CDLL(str(_lib_path()))
     lib.row_store_open.argtypes = [C.c_char_p, U, U, U, U]
     lib.row_store_open.restype = P
+    lib.row_store_open2.argtypes = [C.c_char_p, U, U, U, U, U, U]
+    lib.row_store_open2.restype = P
     lib.row_store_range.argtypes = [P, U, U]
     lib.row_store_stats.argtypes = [P, C.POINTER(U)]
     lib.row_store_attach_packed.argtypes = [P, C.c_char_p, U]
@@ -189,26 +203,14 @@ def _layer_id_from_embeddings(num_embeddings: int, table_dir: Path) -> int:
     )
 
 
-def _tensor_span(root: Path, layer_id: int):
-    index = json.loads((root / "model.safetensors.index.json").read_text())[
-        "weight_map"
-    ]
-    prefix = f"layers.{layer_id}.engram.embed."
-    name = index[prefix + "weight"]
-    if index[prefix + "scale"] != name:
-        raise RuntimeError("Engram weight and scale must share a shard")
-    path = root / name
-    with path.open("rb") as f:
-        length = struct.unpack("<Q", f.read(8))[0]
-        header = json.loads(f.read(length))
-    weight, scale = header[prefix + "weight"], header[prefix + "scale"]
-    base = 8 + length
-    return (
-        path,
-        int(weight["shape"][0]),
-        base + int(weight["data_offsets"][0]),
-        base + int(scale["data_offsets"][0]),
-    )
+def _tensor_span(root: Path, layer_id: int) -> engram_format.TableSpan:
+    span = engram_format.table_span(root, layer_id)
+    want = engram_format.resolve_name(os.environ.get("DSV41_ENGRAM_FORMAT", "auto"))
+    if want != "auto" and span.fmt.name != want:
+        raise RuntimeError(
+            f"Engram tables under {root} are {span.fmt.name}, but DSV41_ENGRAM_FORMAT={want}"
+        )
+    return span
 
 
 def _skip_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
@@ -286,15 +288,23 @@ def _make_init(module):
 
         table_dir = _table_dir()
         layer_id = _layer_id_from_embeddings(self.num_embeddings, table_dir)
-        path, rows, woff, soff = _tensor_span(table_dir, layer_id)
+        span = _tensor_span(table_dir, layer_id)
+        path, rows, woff, soff = span.path, span.rows, span.weight_offset, span.scale_offset
+        fmt = span.fmt
+        if self.dim != engram_format.DIM or self.block_size != engram_format.QUANT_BLOCK:
+            raise RuntimeError(
+                f"Engram dim={self.dim} block={self.block_size}; the row formats assume 256/32"
+            )
+        self._fmt = fmt
         ranks_per_host = max(
             1, tp_size // max(1, int(os.environ.get("NNODES", "1")))
         )
         budget = int(float(os.getenv("DSV41_CACHE_GIB", "8")) * 2**30) // (
             2 * ranks_per_host
         )
-        store = lib.row_store_open(
-            str(path).encode(), rows, woff, soff, budget
+        store = lib.row_store_open2(
+            str(path).encode(), rows, woff, soff, budget,
+            fmt.weight_bytes, fmt.scale_bytes,
         )
         if not store:
             raise RuntimeError(f"Could not open Engram backing shard: {path}")
@@ -328,30 +338,22 @@ def _make_init(module):
         self._ids = torch.empty(
             cap, dtype=torch.int64, device="cpu", pin_memory=True
         )
+        # Raw row bytes as the store hands them over: [rows, weight_bytes] and
+        # [rows, scale_bytes]; the dequant kernel reinterprets them per format.
         self._host_w = torch.empty(
-            (cap, self.dim),
-            dtype=torch.uint8,
-            device="cpu",
-            pin_memory=True,
+            (cap, fmt.weight_bytes), dtype=torch.uint8, device="cpu", pin_memory=True
         )
         self._host_s = torch.empty(
-            (cap, self.dim // self.block_size),
-            dtype=torch.uint8,
-            device="cpu",
-            pin_memory=True,
+            (cap, fmt.scale_bytes), dtype=torch.uint8, device="cpu", pin_memory=True
         )
-        self._dev_w = torch.empty(
-            (cap, self.dim), dtype=torch.uint8, device=device
-        )
-        self._dev_s = torch.empty(
-            (cap, self.dim // self.block_size),
-            dtype=torch.uint8,
-            device=device,
-        )
+        self._dev_w = torch.empty((cap, fmt.weight_bytes), dtype=torch.uint8, device=device)
+        self._dev_s = torch.empty((cap, fmt.scale_bytes), dtype=torch.uint8, device=device)
         logger.info(
-            "File-backed Engram layer=%s rank=%s/%s rows=[%s,%s) "
-            "cache=%.1fGiB scales=%.1fGiB packed=%s (not pinned 47GiB UVA)",
+            "File-backed Engram layer=%s format=%s (%s B/row) rank=%s/%s rows=[%s,%s) "
+            "cache=%.1fGiB scales=%.1fGiB packed=%s (not pinned UVA)",
             layer_id,
+            fmt.name,
+            fmt.row_bytes,
             tp_rank,
             tp_size,
             self.vocab_start_idx,
@@ -361,7 +363,7 @@ def _make_init(module):
             packed or stats["packed"],
         )
         print(
-            f"File-backed Engram layer={layer_id} rank={tp_rank}/{tp_size} "
+            f"File-backed Engram layer={layer_id} format={fmt.name} rank={tp_rank}/{tp_size} "
             f"rows=[{self.vocab_start_idx},{self.vocab_end_idx}) "
             f"cache={stats['cache_bytes']/2**30:.1f}GiB "
             f"packed={packed or stats['packed']}",
@@ -414,7 +416,98 @@ def _dequant_kernel():
     return _dequant_rows_kernel
 
 
+def _dequant_int4_kernel():
+    """diffbot int4_fp16s32 rows: byte b holds elements 2i (low nibble) and
+    2i+1 (high nibble) as q + 8 with q in [-8, 7]; one fp16 scale per 32
+    values; value = q * scale (scripts/quantize/convert_engram_int4.py)."""
+    from vllm.triton_utils import tl, triton
+
+    @triton.jit
+    def _dequant_int4_rows_kernel(
+        packed,
+        scales,
+        out,
+        num_rows,
+        DIM: tl.constexpr,
+        QUANT_BLOCK: tl.constexpr,
+        BLOCK_R: tl.constexpr,
+        GRID: tl.constexpr,
+    ):
+        cols = tl.arange(0, DIM)
+        byte_cols = cols // 2
+        shift = (cols % 2) * 4
+        scale_cols = cols // QUANT_BLOCK
+        for base in tl.range(
+            tl.program_id(0) * BLOCK_R, num_rows, GRID * BLOCK_R
+        ):
+            rows = base + tl.arange(0, BLOCK_R)
+            valid = rows < num_rows
+            packed_bytes = tl.load(
+                packed + rows[:, None] * (DIM // 2) + byte_cols[None, :],
+                mask=valid[:, None],
+                other=0,
+            )
+            nibble = (packed_bytes.to(tl.int32) >> shift[None, :]) & 15
+            values = (nibble - 8).to(tl.float32)
+            scale = tl.load(
+                scales
+                + rows[:, None] * (DIM // QUANT_BLOCK)
+                + scale_cols[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            tl.store(
+                out + rows[:, None] * DIM + cols[None, :],
+                (values * scale).to(tl.bfloat16),
+                mask=valid[:, None],
+            )
+
+    return _dequant_int4_rows_kernel
+
+
 _DEQUANT = None
+_DEQUANT_INT4 = None
+
+
+def dequant_rows(fmt, dev_w: torch.Tensor, dev_s: torch.Tensor, out: torch.Tensor,
+                 rows: int, num_sms: int) -> None:
+    """Dequantize `rows` raw rows (uint8 staging) into `out` [rows, 256] bf16."""
+    global _DEQUANT, _DEQUANT_INT4
+    from vllm.triton_utils import triton
+
+    tiles = triton.cdiv(rows, 16)
+    grid = min(tiles, max(1, num_sms))
+    if fmt.name == engram_format.INT4.name:
+        if _DEQUANT_INT4 is None:
+            _DEQUANT_INT4 = _dequant_int4_kernel()
+        _DEQUANT_INT4[(grid,)](
+            dev_w[:rows],
+            dev_s[:rows].view(torch.float16),
+            out,
+            rows,
+            DIM=engram_format.DIM,
+            QUANT_BLOCK=engram_format.QUANT_BLOCK,
+            BLOCK_R=16,
+            GRID=grid,
+        )
+        return
+    if _DEQUANT is None:
+        _DEQUANT = _dequant_kernel()
+    # dev_w holds the raw fp8 e4m3 row bytes (uint8 staging). Hand the
+    # kernel an fp8 VIEW so its .to(tl.float32) decodes the fp8 encoding;
+    # loading the uint8 buffer directly converts the byte values 0..255
+    # as integers (every embedding ~30x too large and all positive), which
+    # is what made every boot up to 2026-09-12 emit garbage tokens.
+    _DEQUANT[(grid,)](
+        dev_w[:rows].view(torch.float8_e4m3fn),
+        dev_s[:rows],
+        out,
+        rows,
+        DIM=engram_format.DIM,
+        QUANT_BLOCK=engram_format.QUANT_BLOCK,
+        BLOCK_R=16,
+        GRID=grid,
+    )
 
 
 def _make_lookup(module):
@@ -424,7 +517,6 @@ def _make_lookup(module):
         # `module` is a closure variable: `del module` here would make it a
         # local and raise UnboundLocalError on the first lookup.
         del background
-        global _DEQUANT
         lib, cuda = _ensure_native()
         tokens = int(indices.shape[0])
         local_heads = int(self.part_n_hash_cols)
@@ -464,27 +556,8 @@ def _make_lookup(module):
             raise RuntimeError(f"CUDA Engram host callback failed: {error}")
         self._dev_w[:rows].copy_(self._host_w[:rows], non_blocking=True)
         self._dev_s[:rows].copy_(self._host_s[:rows], non_blocking=True)
-        if _DEQUANT is None:
-            _DEQUANT = _dequant_kernel()
-        from vllm.triton_utils import triton
-
-        packed_out = out.reshape(rows, self.dim)
-        tiles = triton.cdiv(rows, 16)
-        grid = min(tiles, max(1, self._num_sms))
-        # _dev_w holds the raw fp8 e4m3 row bytes (uint8 staging). Hand the
-        # kernel an fp8 VIEW so its .to(tl.float32) decodes the fp8 encoding;
-        # loading the uint8 buffer directly converts the byte values 0..255
-        # as integers (every embedding ~30x too large and all positive), which
-        # is what made every boot up to 2026-09-12 emit garbage tokens.
-        _DEQUANT[(grid,)](
-            self._dev_w.view(torch.float8_e4m3fn),
-            self._dev_s,
-            packed_out,
-            rows,
-            DIM=self.dim,
-            QUANT_BLOCK=self.block_size,
-            BLOCK_R=16,
-            GRID=grid,
+        dequant_rows(
+            self._fmt, self._dev_w, self._dev_s, out.reshape(rows, self.dim), rows, self._num_sms
         )
 
     return lookup

@@ -75,6 +75,71 @@ resolve_model_files() {
     fi
 }
 
+# --- Engram tables ---------------------------------------------------------
+# Only shards 47+48 of a 48-shard tree hold the n-gram tables; with the index
+# and config.json that is all the backend reads. The row format is detected
+# from the shard headers (overlay/engram_format.py):
+#   int4_fp16s32  diffbot's re-encode, 144 B/row, ~103 GiB for both layers (1017)
+#   fp8_e8m0      stock DeepSeek, 264 B/row, ~190 GiB (0909 or 1017 release)
+ENGRAM_FILES=(
+    "model-00047-of-00048.safetensors"
+    "model-00048-of-00048.safetensors"
+    "model.safetensors.index.json"
+    "config.json"
+)
+_DSV41_STOCK_ENGRAM_REPO="deepseek-ai/DeepSeek-V4.1-Flash"
+_DSV41_INT4_ENGRAM_REPO="diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000"
+
+# Format of the tables under $1: fp8_e8m0 | int4_fp16s32 | none.
+engram_dir_format() {
+    python3 "$SCRIPT_DIR/overlay/engram_format.py" "$1" 2>/dev/null || printf 'none'
+}
+
+# ENGRAM_FORMAT (int4 default | fp8 | auto) -> canonical ENGRAM_FORMAT plus the
+# HF_ENGRAM_REPO / ENGRAM_DIR defaults for it. Explicit values are kept.
+resolve_engram() {
+    ENGRAM_FORMAT="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import engram_format
+try:
+    print(engram_format.resolve_name(sys.argv[2]))
+except ValueError as exc:
+    print(f"ENGRAM_FORMAT: {exc}", file=sys.stderr); sys.exit(2)' "$SCRIPT_DIR/overlay" "${ENGRAM_FORMAT:-int4}")" || return 2
+    case "$ENGRAM_FORMAT" in
+        int4_fp16s32)
+            HF_ENGRAM_REPO="${HF_ENGRAM_REPO:-$_DSV41_INT4_ENGRAM_REPO}"
+            ENGRAM_DIR="${ENGRAM_DIR:-$SCRIPT_DIR/engram-int4}"
+            ;;
+        *)
+            HF_ENGRAM_REPO="${HF_ENGRAM_REPO:-$_DSV41_STOCK_ENGRAM_REPO}"
+            ENGRAM_DIR="${ENGRAM_DIR:-$SCRIPT_DIR/engram-src}"
+            ;;
+    esac
+    ENGRAM_DIR="$(_dsv41_abs "$ENGRAM_DIR")"
+}
+
+engram_complete() {
+    local f
+    for f in "${ENGRAM_FILES[@]}"; do
+        [ -f "$ENGRAM_DIR/$f" ] || return 1
+    done
+    return 0
+}
+
+# The tables under $1 must exist and match ENGRAM_FORMAT (unless auto). Prints
+# the format found.
+check_engram_format() {
+    local have
+    have="$(engram_dir_format "$1")"
+    if [ "$have" = "none" ]; then
+        echo "no Engram tables (layers.{1,14}.engram.embed.*) under $1" >&2
+        return 1
+    fi
+    if [ "$ENGRAM_FORMAT" != "auto" ] && [ "$have" != "$ENGRAM_FORMAT" ]; then
+        echo "Engram tables under $1 are $have, but ENGRAM_FORMAT=$ENGRAM_FORMAT; set ENGRAM_FORMAT=auto to serve them as they are, or point ENGRAM_DIR at $ENGRAM_FORMAT tables" >&2
+        return 1
+    fi
+    printf '%s' "$have"
+}
+
 # Warn (never fail) when config.json is not the EXL3 layout this overlay loads.
 check_model_config() {
     [ -f "$MODEL_HOST/config.json" ] || return 0

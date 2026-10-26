@@ -1,14 +1,15 @@
 """Repack this rank's owned Engram rows into a local contiguous shard.
 
-In the checkpoint a row's 256 B of weight and its 8 B of scale sit in two tensors
-about 98 GB apart, so a cache miss costs two reads into unrelated 4 KiB pages --
-and on a worker both of them are NFS round trips to the head. Packing the owned
-rows as 264 B records on local disk makes a miss one local read.
+In the checkpoint a row's weight bytes and its scale bytes sit in two tensors
+tens of GB apart, so a cache miss costs two reads into unrelated 4 KiB pages.
+Packing the owned rows as contiguous records (weight then scale: 264 B for the
+stock fp8 tables, 144 B for diffbot's int4 tables) on local disk makes a miss
+one local read. The format is read from the shard header (engram_format.py).
 
 vLLM shards by hash-head buckets (not an even row split). This packer uses
 that same [lo, hi) so row_store_attach_packed accepts the shard.
 
-Per rank at TP=2: ~47 GiB of rows → ~48 GiB packed (264 B/row) per layer.
+Per rank at TP=2 and per layer: ~48 GiB packed for fp8 rows, ~26 GiB for int4.
 
 Run inside the serving image, where /models is the checkpoint and the output
 directory is node-local storage:
@@ -31,31 +32,19 @@ for _p in (_HERE.parent / "overlay", Path("/opt/dsv41")):
     if (_p / "engram_layout.py").is_file():
         sys.path.insert(0, str(_p))
         break
+from engram_format import table_span  # noqa: E402
 from engram_layout import layer_head_sizes_from_config, shard_range  # noqa: E402
 
 MAGIC = 0x31344E4531565344  # "DSV41EN1"
 HEADER_BYTES = 4096
-ROW_BYTES = 264
-WEIGHT_BYTES = 256
-SCALE_BYTES = 8
 ENGRAM_LAYERS = (1, 14)
 
 
 def tensor_span(root: Path, layer_id: int):
-    index = json.loads((root / 'model.safetensors.index.json').read_text())['weight_map']
-    prefix = f'layers.{layer_id}.engram.embed.'
-    name = index[prefix + 'weight']
-    assert index[prefix + 'scale'] == name, 'weight and scale must share a shard'
-    path = root / name
-    with path.open('rb') as f:
-        length = struct.unpack('<Q', f.read(8))[0]
-        header = json.loads(f.read(length))
-    weight, scale = header[prefix + 'weight'], header[prefix + 'scale']
-    assert weight['dtype'] == 'F8_E4M3' and scale['dtype'] == 'F8_E8M0'
-    assert weight['shape'][1] == WEIGHT_BYTES and scale['shape'][1] == SCALE_BYTES
-    base = 8 + length
-    return (path, weight['shape'][0],
-            base + weight['data_offsets'][0], base + scale['data_offsets'][0])
+    """(path, rows, weight_offset, scale_offset, weight_bytes, scale_bytes)."""
+    s = table_span(root, layer_id)
+    return (s.path, s.rows, s.weight_offset, s.scale_offset,
+            s.fmt.weight_bytes, s.fmt.scale_bytes)
 
 
 def owned_row_range(root: Path, layer_id: int, rank: int, tp: int) -> tuple[int, int]:
@@ -70,7 +59,8 @@ def owned_row_range(root: Path, layer_id: int, rank: int, tp: int) -> tuple[int,
 
 def pack_layer(root: Path, out_dir: Path, layer_id: int, rank: int, tp: int,
                chunk_rows: int) -> Path:
-    path, rows, weight_off, scale_off = tensor_span(root, layer_id)
+    path, rows, weight_off, scale_off, WEIGHT_BYTES, SCALE_BYTES = tensor_span(root, layer_id)
+    ROW_BYTES = WEIGHT_BYTES + SCALE_BYTES
     lo, hi = owned_row_range(root, layer_id, rank, tp)
     if not (0 <= lo < hi <= rows):
         raise SystemExit(
@@ -138,7 +128,8 @@ def main() -> int:
     need = 0
     for layer_id in layers:
         lo, hi = owned_row_range(root, layer_id, args.rank, args.tp)
-        need += HEADER_BYTES + (hi - lo) * ROW_BYTES
+        _, _, _, _, wb, sb = tensor_span(root, layer_id)
+        need += HEADER_BYTES + (hi - lo) * (wb + sb)
     free = os.statvfs(out_dir).f_bavail * os.statvfs(out_dir).f_frsize
     print(f'rank {args.rank}/{args.tp}: need {need/2**30:.1f} GiB, '
           f'{free/2**30:.1f} GiB free at {out_dir}', flush=True)

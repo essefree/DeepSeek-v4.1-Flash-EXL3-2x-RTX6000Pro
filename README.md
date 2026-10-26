@@ -62,8 +62,9 @@ The cost is decode speed: each offloaded layer's active experts cross PCIe 5.0 (
 
 ## Quick start
 
-Requirements: Linux x86_64, NVIDIA driver with CUDA 13 support, Docker with `nvidia-container-toolkit`, ~400 GB of
-disk, and `pip install -U 'huggingface_hub[hf_transfer]'`.
+Requirements: Linux x86_64, NVIDIA driver with CUDA 13 support, Docker with `nvidia-container-toolkit`, ~330 GB of
+disk (EXL3 ~197 GiB + int4 Engram ~103 GiB; ~420 GB with the stock fp8 Engram), and
+`pip install -U 'huggingface_hub[hf_transfer]'`.
 
 ```bash
 cp .env.example .env      # first run also does this; review GPUS / DSV41_EXL3_HOST_EXPERT_LAYERS
@@ -89,11 +90,32 @@ Or set `MODEL=` in `.env` (same two forms). With nothing set, it uses Mia's 2.9b
 - **Checks:** the preflight prints the checkpoint's `quant_method`/`codebook`/`avg_bits` and warns when they don't
   match what the overlay loads.
 
-**DeepSeek 0909 vs 1017.** Both releases have the same architecture, config, tokenizer and prompt encoder,
-so the image serves either. Every shard differs, though, so the Engram tables (shards 47+48) must come from
-the same release as the quant. A checkpoint that bundles its own stock 47+48 is used as-is: the launcher
-points `ENGRAM_DIR` at it and hides those shards from the model loader. Otherwise, for a 1017 quant, set
-`HF_ENGRAM_REPO=deepseek-ai/DeepSeek-V4.1-Flash-1017`.
+### Engram tables: int4 (default) or stock fp8
+
+The n-gram tables are read row by row from disk through the page cache and never touch VRAM, so their
+size decides how much of them stays in RAM. `ENGRAM_FORMAT` in `.env` picks the encoding; the backend
+detects the real format from the shard headers and refuses a mismatch.
+
+| `ENGRAM_FORMAT` | Tables | Row | On disk | Source |
+|---|---|---:|---:|---|
+| `int4` *(default)* | diffbot's int4 re-encode of DeepSeek **1017** (`int4_fp16s32`) | 144 B | ~103 GiB | [`diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000`](https://huggingface.co/diffbot/DeepSeek-V4.1-Flash-EXL3-3bpw-2x-RTX-PRO-6000) shards 47+48 → `./engram-int4` |
+| `fp8` | stock DeepSeek (`fp8_e8m0`), exact | 264 B | ~190 GiB | `deepseek-ai/DeepSeek-V4.1-Flash` (0909) or `-1017` → `./engram-src` |
+| `auto` | whatever `ENGRAM_DIR` or the checkpoint bundles | | | |
+
+Why int4 by default on this box: with ~60 GiB pinned (host experts, scales, vLLM), about 190 GiB of
+page cache is left. The int4 tables fit in it entirely, so after warm-up every Engram row read is a
+memory hit; the fp8 tables do not quite fit and keep going back to NVMe during long prefills. The cost
+is precision: diffbot measured ~9% relative row error (row cosine 0.995) against fp8, and no one has
+measured the end-to-end effect on this stack yet. Set `ENGRAM_FORMAT=fp8` to compare.
+
+**Release rule.** DeepSeek 0909 and 1017 share the architecture, config, tokenizer and prompt encoder, so
+the image serves either, but every shard differs, so the Engram tables must come from the same release
+as the quant. diffbot's int4 tables are 1017: the launcher refuses them with Mia's (0909) checkpoint.
+A checkpoint that bundles stock 47+48 is used as-is under `fp8`/`auto` (the launcher points `ENGRAM_DIR`
+at it and hides those shards from the model loader); under `int4` they are left alone.
+
+Both formats work with `./start.sh pack` (per-rank rows on local NVMe: ~26 GiB/rank/layer int4,
+~47 GiB fp8) and with `DSV41_RESIDENT_SCALES` (16 B/row int4, 8 B/row fp8, pinned per rank).
 
 `python3 scripts/inspect_checkpoint.py <dir>` reads only the shard headers and reports whether a checkpoint
 loads as-is: native linears where EXL3 is expected, index and shard mismatches, the K map, and bundled Engram.

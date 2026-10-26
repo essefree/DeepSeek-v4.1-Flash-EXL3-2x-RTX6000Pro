@@ -77,7 +77,7 @@ _cli_keys=(SPEC_METHOD ENFORCE_EAGER EXL3_FUSED_MOE EXL3_MOE_ROW_TILE EXL3_TEMP_
            EXL3_FAT_SORTED EXL3_FAT_BATCHED EXL3_FAT_KERNEL EXL3_FAT_GROUPED MAX_NUM_BATCHED_TOKENS
            IMAGE GPU_MEM_UTIL LANGUAGE_MODEL_ONLY MAX_NUM_SEQS MAX_MODEL_LEN DSPARK_TOKENS
            DSV41_EXL3_HOST_EXPERT_LAYERS GPUS MODEL MODEL_HOST HF_MODEL_REPO HF_MODEL_REVISION
-           ENGRAM_DIR KMAP_HOST EXPECTED_SHARDS)
+           ENGRAM_DIR ENGRAM_FORMAT HF_ENGRAM_REPO KMAP_HOST EXPECTED_SHARDS)
 # (plain _cli_<KEY> variables, not an associative array: macOS ships bash 3.2)
 for _k in "${_cli_keys[@]}"; do
     if [ -n "${!_k-}" ]; then printf -v "_cli_$_k" '%s' "${!_k}"; fi
@@ -164,13 +164,7 @@ VLLM_API_KEY="${VLLM_API_KEY:-}"
 
 CONTAINER="${CONTAINER:-dsv41-exl3}"
 
-ENGRAM_DIR="${ENGRAM_DIR:-$SCRIPT_DIR/engram-src}"
-HF_ENGRAM_REPO="${HF_ENGRAM_REPO:-deepseek-ai/DeepSeek-V4.1-Flash}"
 AUTO_DOWNLOAD="${AUTO_DOWNLOAD:-1}"
-# docker -v needs absolute paths; .env may give them relative to this checkout.
-for _v in ENGRAM_DIR; do
-    case "${!_v}" in /*) ;; *) printf -v "$_v" '%s' "$SCRIPT_DIR/${!_v#./}" ;; esac
-done
 CACHE_ROOT="${CACHE_ROOT:-$HOME/.cache/vllm-dsv41-flash-exl3}"
 ENGRAM_SRC="${ENGRAM_SRC:-$CACHE_ROOT/engram-src}"
 TRITON_HOST_CACHE="${TRITON_HOST_CACHE:-$CACHE_ROOT/triton}"
@@ -193,10 +187,12 @@ PACKED_MOUNT="${PACKED_MOUNT:-/engram-packed}"
 LOGDIR="$SCRIPT_DIR/logs"
 INNER_SCRIPT="$SCRIPT_DIR/.dsv41-exl3.inner.sh"
 HEAD_SCRIPT="$INNER_SCRIPT"
-# MODEL / MODEL_HOST / HF_MODEL_REPO -> MODEL_HOST (absolute), EXPECTED_SHARDS, KMAP_HOST.
+# MODEL / MODEL_HOST / HF_MODEL_REPO -> MODEL_HOST (absolute), EXPECTED_SHARDS, KMAP_HOST;
+# ENGRAM_FORMAT -> HF_ENGRAM_REPO / ENGRAM_DIR (absolute).
 # shellcheck source=scripts/resolve_model.sh
 source "$SCRIPT_DIR/scripts/resolve_model.sh"
 resolve_model || exit 2
+resolve_engram || exit 2
 
 # ------------------------------- helpers -----------------------------------
 log()  { printf '\033[1;36m[dsv41-exl3]\033[0m %s\n' "$*"; }
@@ -318,21 +314,7 @@ hf_fetch() {
 
 # Engram needs only shards 47+48 of the 48-shard original (~95 GiB each), the
 # index, and config.json; the other 46 shards are never read. Do not pull the
-# whole 476 GiB repo.
-ENGRAM_FILES=(
-    "model-00047-of-00048.safetensors"
-    "model-00048-of-00048.safetensors"
-    "model.safetensors.index.json"
-    "config.json"
-)
-
-engram_complete() {
-    local f
-    for f in "${ENGRAM_FILES[@]}"; do
-        [ -f "$ENGRAM_DIR/$f" ] || return 1
-    done
-    return 0
-}
+# whole tree. (ENGRAM_FILES / engram_complete live in scripts/resolve_model.sh.)
 
 # Shards of MODEL_HOST that hold Engram n-gram tables (*.engram.embed.*),
 # e.g. stock DeepSeek shards 47/48 placed next to an EXL3 pack.
@@ -345,17 +327,22 @@ print("\n".join(sorted({f for k,f in wm.items() if ".engram.embed." in k})))' "$
 }
 
 # A checkpoint that ships its own Engram shards serves them, unless ENGRAM_DIR
-# already holds a complete set (it then has to match the checkpoint's release).
+# already holds a complete set (it then has to match the checkpoint's release)
+# or ENGRAM_FORMAT asks for another row format than the bundled tables use.
 adopt_model_engram() {
     engram_complete && return 0
-    local shards f ok=1
+    local shards f ok=1 fmt
     shards="$(model_engram_shards)"
     [ -n "$shards" ] || return 0
     for f in "${ENGRAM_FILES[@]}"; do [ -f "$MODEL_HOST/$f" ] || ok=0; done
-    if [ "$ok" = "1" ]; then
-        log "Engram: using the tables bundled with the checkpoint ($(echo $shards)) — ENGRAM_DIR=$MODEL_HOST"
-        ENGRAM_DIR="$MODEL_HOST"
+    [ "$ok" = "1" ] || return 0
+    fmt="$(engram_dir_format "$MODEL_HOST")"
+    if [ "$ENGRAM_FORMAT" != "auto" ] && [ "$fmt" != "$ENGRAM_FORMAT" ]; then
+        log "Engram: the checkpoint bundles $fmt tables ($(echo $shards)), but ENGRAM_FORMAT=$ENGRAM_FORMAT — not using them (ENGRAM_FORMAT=auto or fp8 would)"
+        return 0
     fi
+    log "Engram: using the $fmt tables bundled with the checkpoint ($(echo $shards)) — ENGRAM_DIR=$MODEL_HOST"
+    ENGRAM_DIR="$MODEL_HOST"
 }
 
 # vLLM loads every shard the index names. When the Engram shards sit inside
@@ -437,7 +424,9 @@ fetch_weights() {
         engram_complete && need_engram=0
     fi
     if [ "$need_engram" = "1" ]; then
-        log "fetching Engram shards 47+48 from ${HF_ENGRAM_REPO} into ${ENGRAM_DIR} (~190 GiB, resumable)"
+        local size="~190 GiB (stock fp8)"
+        [ "$ENGRAM_FORMAT" = "int4_fp16s32" ] && size="~103 GiB (int4)"
+        log "fetching Engram shards 47+48 from ${HF_ENGRAM_REPO} into ${ENGRAM_DIR} (${size}, resumable)"
         mkdir -p "$ENGRAM_DIR"
         local inc=() f
         for f in "${ENGRAM_FILES[@]}"; do inc+=(--include "$f"); done
@@ -614,12 +603,24 @@ check_memory_headroom() {
         i=$((i + 1))
     done < <(gpu_query memory.free)
     [ "$bad" = "0" ] || die "not enough free VRAM: offload more layers (DSV41_EXL3_HOST_EXPERT_LAYERS, e.g. 32-39), set LANGUAGE_MODEL_ONLY=1, or stop other GPU processes"
-    # Pinned memory cannot be swapped: two ranks of host experts + resident
-    # Engram scales (~6 GiB) + ~20 GiB for vLLM itself must fit in MemAvailable.
-    local need_host avail
-    need_host=$(awk -v h="$host_gib" -v t="$TP" 'BEGIN { printf "%.1f", h * t + 26 }')
+    # Pinned memory cannot be swapped: two ranks of host experts + the resident
+    # Engram scales (8 B/row fp8, 16 B/row int4, over all ~768M rows) + ~20 GiB
+    # for vLLM itself must fit in MemAvailable. Everything left is page cache
+    # for the Engram rows themselves (~103 GiB int4 / ~190 GiB fp8).
+    local need_host avail scales_gib
+    scales_gib=$(python3 - "$ENGRAM_DIR" "${DSV41_RESIDENT_SCALES:-1}" "$SCRIPT_DIR/overlay" <<'PY' 2>/dev/null || echo 6
+import json, sys
+sys.path.insert(0, sys.argv[3])
+import engram_format
+fmt = engram_format.detect(sys.argv[1])
+cfg = json.load(open(sys.argv[1] + "/config.json"))
+rows = sum(int(x) for x in (cfg.get("text_config") or cfg)["engram_num_embeddings"])
+print("%.1f" % (rows * fmt.scale_bytes / 2**30 if fmt and sys.argv[2] != "0" else 0))
+PY
+)
+    need_host=$(awk -v h="$host_gib" -v t="$TP" -v s="$scales_gib" 'BEGIN { printf "%.1f", h * t + s + 20 }')
     avail=$(awk '/^MemAvailable:/ { printf "%.1f", $2 / 1048576 }' /proc/meminfo)
-    log "host RAM: need ~${need_host} GiB, MemAvailable ${avail} GiB"
+    log "host RAM: need ~${need_host} GiB pinned (experts $(awk -v h="$host_gib" -v t="$TP" 'BEGIN { printf "%.1f", h * t }') + Engram scales ${scales_gib} + vLLM ~20), MemAvailable ${avail} GiB"
     awk -v a="$avail" -v n="$need_host" 'BEGIN { exit !(a + 0 >= n + 0) }' \
         || die "not enough host RAM for the pinned host experts (${need_host} GiB)"
 }
@@ -663,6 +664,14 @@ preflight() {
     [ "${have:-0}" -ge "$EXPECTED_SHARDS" ] \
         || die "EXL3 checkpoint at $MODEL_HOST has ${have:-0}/$EXPECTED_SHARDS shards"
     engram_complete || die "Engram shards 47+48 / index / config missing under ENGRAM_DIR=$ENGRAM_DIR"
+    ENGRAM_FORMAT_FOUND="$(check_engram_format "$ENGRAM_DIR")" || die "Engram tables under $ENGRAM_DIR do not match ENGRAM_FORMAT=$ENGRAM_FORMAT"
+    log "Engram: ${ENGRAM_DIR} (${ENGRAM_FORMAT_FOUND}: $([ "$ENGRAM_FORMAT_FOUND" = int4_fp16s32 ] && echo '144 B/row, ~103 GiB' || echo '264 B/row, ~190 GiB'))"
+    # diffbot's int4 tables were made from the 1017 release; Mia's default
+    # checkpoint is 0909 (every shard differs between the two).
+    if [ "$ENGRAM_FORMAT_FOUND" = "int4_fp16s32" ] && [ "$MODEL_SOURCE" = "hf" ] \
+       && [ "$HF_MODEL_REPO" = "$_DSV41_DEFAULT_REPO" ] && [ "${ENGRAM_ALLOW_RELEASE_MISMATCH:-0}" != "1" ]; then
+        die "int4 Engram tables (DeepSeek 1017) with Mia's 2.9bpw checkpoint (DeepSeek 0909): the releases differ. Use ENGRAM_FORMAT=fp8 for Mia's quant, or a 1017 quant (--model) with the int4 tables. ENGRAM_ALLOW_RELEASE_MISMATCH=1 overrides."
+    fi
 
     check_memory_headroom
     log "preflight OK ($(hostname))"
@@ -762,7 +771,7 @@ launch() {
     for f in patch_suppress_stops_in_reasoning.py patch_scheduler_decode_floor.py \
              patch_xgrammar_termination.py patch_spinwait.py patch_responses_content_types.py \
              patch_exl3_packed_names.py patch_exl3_lm_head.py patch_engram_secondary.py \
-             patch_engram_file.py engram_file_backend.py engram_layout.py patch_memory_log.py \
+             patch_engram_file.py engram_file_backend.py engram_layout.py engram_format.py patch_memory_log.py \
              patch_h2d_stage.py patch_sm120_block64.py; do
         ov+=(-v "$SCRIPT_DIR/overlay/$f:/opt/dsv41/$f:ro")
     done
@@ -778,7 +787,7 @@ launch() {
              KV_CACHE_MEMORY_BYTES KV_BLOCK_SIZE DSV41_SKIP_MIXED_WARMUP DSV41_DROP_PAGE_CACHE \
              DSV41_MEM_SOURCE DSV41_PREFILL_EMPTY_CACHE_TOKENS DSV41_PREFILL_EMPTY_CACHE_MEMAVAIL_GIB \
              DSV41_PREFILL_END_EMPTY_CACHE VLLM_SPARSE_INDEXER_MAX_LOGITS_MB DSV41_INDEXER_PREFILL_FACTOR \
-             DSV41_EXL3_HOST_EXPERT_LAYERS DSV41_NATIVE_LINEARS DSV41_EXL3_SERIAL_STREAMS DSV41_ENGRAM_DISABLE \
+             DSV41_EXL3_HOST_EXPERT_LAYERS DSV41_NATIVE_LINEARS DSV41_ENGRAM_FORMAT DSV41_EXL3_SERIAL_STREAMS DSV41_ENGRAM_DISABLE \
              VLLM_DISABLE_SHARED_EXPERTS_STREAM DISABLE_CUSTOM_ALL_REDUCE CUDA_LAUNCH_BLOCKING \
              NCCL_DEBUG NCCL_DEBUG_SUBSYS NCCL_P2P_DISABLE \
              GLM53_SUPPRESS_STOPS_IN_REASONING GLM53_MIXED_PREFILL_CHUNK GLM53_INDEXER_WORKSPACE \
@@ -907,6 +916,7 @@ start() {
     prepare_engram_src_dir
     prepare_model_view
     write_inner_scripts
+    DSV41_ENGRAM_FORMAT="${ENGRAM_FORMAT_FOUND:-$ENGRAM_FORMAT}"
     log "config: image=${IMAGE} tp=${TP} spec=${SPEC_METHOD} k=${DSPARK_TOKENS} max-len=${MAX_MODEL_LEN} mnbt=${MAX_NUM_BATCHED_TOKENS} kv-pool=${KV_CACHE_MEMORY_BYTES:-profiled} lm-only=${LANGUAGE_MODEL_ONLY} host-experts=${DSV41_EXL3_HOST_EXPERT_LAYERS:-none}"
     launch
     if wait_for_health; then

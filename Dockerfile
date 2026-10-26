@@ -124,6 +124,7 @@ COPY overlay/patch_exl3_lm_head.py /opt/dsv41/patch_exl3_lm_head.py
 COPY overlay/patch_engram_secondary.py /opt/dsv41/patch_engram_secondary.py
 COPY overlay/patch_engram_file.py /opt/dsv41/patch_engram_file.py
 COPY overlay/engram_layout.py /opt/dsv41/engram_layout.py
+COPY overlay/engram_format.py /opt/dsv41/engram_format.py
 COPY overlay/engram_file_backend.py /opt/dsv41/engram_file_backend.py
 COPY overlay/row_store.cpp /opt/dsv41/row_store.cpp
 COPY overlay/patch_suppress_stops_in_reasoning.py /opt/dsv41/patch_suppress_stops_in_reasoning.py

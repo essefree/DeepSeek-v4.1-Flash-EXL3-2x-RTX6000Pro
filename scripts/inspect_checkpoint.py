@@ -146,9 +146,17 @@ def main() -> int:
     # 2. Engram tables bundled in the model directory.
     eng = sorted({v["file"] for k, v in h.items() if ".engram.embed." in k})
     if eng:
-        notes.append(f"Engram tables are inside this directory ({', '.join(eng)}): ./start.sh uses them as "
-                     "ENGRAM_DIR and hides them from the model loader (a view without those shards); they "
-                     "must be from the same DeepSeek release (0909 or 1017) as the quant")
+        sys.path.insert(0, str(ROOT / "overlay"))
+        try:
+            import engram_format
+            fmt = engram_format.detect(model)
+            fmt_s = f"{fmt.name}, {fmt.row_bytes} B/row" if fmt else "unknown format"
+        except Exception as exc:  # header-only probe; never fail the report on it
+            fmt_s = f"format check failed: {exc}"
+        notes.append(f"Engram tables are inside this directory ({', '.join(eng)}; {fmt_s}): with "
+                     "ENGRAM_FORMAT=auto (or a matching ENGRAM_FORMAT) ./start.sh uses them as ENGRAM_DIR and "
+                     "hides them from the model loader; they must be from the same DeepSeek release (0909 or "
+                     "1017) as the quant")
 
     # 3. K per tensor against the K map.
     km = json.loads(Path(a.kmap).read_text())

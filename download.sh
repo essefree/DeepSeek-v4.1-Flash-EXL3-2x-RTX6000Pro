@@ -5,9 +5,9 @@
 # ~197 GiB, into ./model; another repo goes to ./models/<org>__<name>).
 # A local MODEL directory is only verified, never downloaded into.
 #   ./download.sh [--model <dir | hf-org/name>] [--revision <rev>]
-# Engram tables are never quantized and never copied into the EXL3 tree: only
-# shards 47+48 of the original 48-shard checkpoint (~95 GiB each), the index,
-# and config.json are pulled from HF_ENGRAM_REPO into ENGRAM_DIR.
+# Engram tables: shards 47+48, the index and config.json from HF_ENGRAM_REPO
+# into ENGRAM_DIR. ENGRAM_FORMAT=int4 (default) takes diffbot's int4 tables
+# (~103 GiB, DeepSeek 1017); ENGRAM_FORMAT=fp8 the stock DeepSeek ones (~190 GiB).
 #
 # Resumable — re-run after an interruption. ./start.sh runs the same fetch
 # automatically, so this script is only for staging the download separately.
@@ -36,9 +36,7 @@ KMAP_HOST="${KMAP_HOST:-$SCRIPT_DIR/files/exl3_k_map.json}"
 # shellcheck source=scripts/resolve_model.sh
 source "$SCRIPT_DIR/scripts/resolve_model.sh"
 resolve_model || exit 2
-
-ENGRAM_DIR="${ENGRAM_DIR:-$SCRIPT_DIR/engram-src}"
-HF_ENGRAM_REPO="${HF_ENGRAM_REPO:-deepseek-ai/DeepSeek-V4.1-Flash}"
+resolve_engram || exit 2
 export HF_HUB_ENABLE_HF_TRANSFER="${HF_HUB_ENABLE_HF_TRANSFER:-1}"
 
 # With `set -euo pipefail`, probing a missing destination with find(1) exits
@@ -75,19 +73,13 @@ if [ "${have:-0}" -lt "$EXPECTED_SHARDS" ] || [ ! -f "$MODEL_HOST/config.json" ]
     resolve_model_files
 fi
 
-ENGRAM_FILES=(
-    "model-00047-of-00048.safetensors"
-    "model-00048-of-00048.safetensors"
-    "model.safetensors.index.json"
-    "config.json"
-)
 missing=()
 for f in "${ENGRAM_FILES[@]}"; do
     [ -f "$ENGRAM_DIR/$f" ] || missing+=("$f")
 done
-echo "Engram  $ENGRAM_DIR  $(( ${#ENGRAM_FILES[@]} - ${#missing[@]} ))/${#ENGRAM_FILES[@]} files"
+echo "Engram  $ENGRAM_DIR  $(( ${#ENGRAM_FILES[@]} - ${#missing[@]} ))/${#ENGRAM_FILES[@]} files  (ENGRAM_FORMAT=$ENGRAM_FORMAT)"
 if [ "${#missing[@]}" -gt 0 ]; then
-    echo "fetching $HF_ENGRAM_REPO (shards 47+48 + index/config only) -> $ENGRAM_DIR"
+    echo "fetching $HF_ENGRAM_REPO (shards 47+48 + index/config only, $([ "$ENGRAM_FORMAT" = int4_fp16s32 ] && echo '~103 GiB int4' || echo '~190 GiB fp8')) -> $ENGRAM_DIR"
     mkdir -p "$ENGRAM_DIR"
     inc=()
     for f in "${ENGRAM_FILES[@]}"; do inc+=(--include "$f"); done
@@ -99,6 +91,8 @@ have=$(find "$MODEL_HOST" -maxdepth 1 -name 'model-*.safetensors' 2>/dev/null | 
 for f in "${ENGRAM_FILES[@]}"; do
     [ -f "$ENGRAM_DIR/$f" ] || { echo "missing $ENGRAM_DIR/$f" >&2; exit 1; }
 done
+fmt="$(check_engram_format "$ENGRAM_DIR")" || exit 1
+echo "Engram  $ENGRAM_DIR  format=$fmt"
 check_model_config
 echo "complete. ./start.sh serves both trees from this host."
 if [ -n "${MODEL:-}" ]; then
