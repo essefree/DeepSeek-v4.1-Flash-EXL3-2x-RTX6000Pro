@@ -334,11 +334,71 @@ engram_complete() {
     return 0
 }
 
+# Shards of MODEL_HOST that hold Engram n-gram tables (*.engram.embed.*),
+# e.g. stock DeepSeek shards 47/48 placed next to an EXL3 pack.
+model_engram_shards() {
+    local idx="$MODEL_HOST/model.safetensors.index.json"
+    [ -f "$idx" ] || return 0
+    python3 -c 'import json,sys
+wm=json.load(open(sys.argv[1]))["weight_map"]
+print("\n".join(sorted({f for k,f in wm.items() if ".engram.embed." in k})))' "$idx"
+}
+
+# A checkpoint that ships its own Engram shards serves them, unless ENGRAM_DIR
+# already holds a complete set (it then has to match the checkpoint's release).
+adopt_model_engram() {
+    engram_complete && return 0
+    local shards f ok=1
+    shards="$(model_engram_shards)"
+    [ -n "$shards" ] || return 0
+    for f in "${ENGRAM_FILES[@]}"; do [ -f "$MODEL_HOST/$f" ] || ok=0; done
+    if [ "$ok" = "1" ]; then
+        log "Engram: using the tables bundled with the checkpoint ($(echo $shards)) — ENGRAM_DIR=$MODEL_HOST"
+        ENGRAM_DIR="$MODEL_HOST"
+    fi
+}
+
+# vLLM loads every shard the index names. When the Engram shards sit inside
+# the checkpoint, serve the model from a view without them: symlinks to the
+# real files plus an index minus the Engram shards' tensors.
+MODEL_VIEW=""
+prepare_model_view() {
+    local shards
+    shards="$(model_engram_shards)"
+    [ -n "$shards" ] || { MODEL_VIEW=""; return 0; }
+    MODEL_VIEW="$CACHE_ROOT/model-view/$(python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:12])' "$MODEL_HOST")"
+    python3 - "$MODEL_HOST" "$MODEL_VIEW" <<'PY' || die "could not build the model view at $MODEL_VIEW"
+import json, os, sys
+src, dst = sys.argv[1:3]
+idx = json.load(open(os.path.join(src, "model.safetensors.index.json")))
+wm = idx["weight_map"]
+eng = {f for k, f in wm.items() if ".engram.embed." in k}
+os.makedirs(dst, exist_ok=True)
+for f in os.listdir(dst):
+    os.unlink(os.path.join(dst, f))
+for f in os.listdir(src):
+    s = os.path.join(src, f)
+    if f in eng or f == "model.safetensors.index.json" or not os.path.isfile(s):
+        continue
+    os.symlink(os.path.realpath(s), os.path.join(dst, f))
+keep = {k: f for k, f in wm.items() if f not in eng}
+json.dump({"metadata": idx.get("metadata", {}), "weight_map": keep},
+          open(os.path.join(dst, "model.safetensors.index.json"), "w"))
+print(f"[dsv41-exl3] model view {dst}: hides {sorted(eng)} ({len(wm) - len(keep)} tensors) from the model loader")
+PY
+}
+
+# Directories that hold the real files behind the symlinks in $1.
+link_target_dirs() {
+    find "$1" -maxdepth 1 -type l -exec readlink -f {} \; 2>/dev/null | xargs -r -n1 dirname | sort -u
+}
+
 fetch_weights() {
     local need_model=0 need_engram=0 have
     have="$(count_model_shards "$MODEL_HOST")"
     [ "${have:-0}" -ge "$EXPECTED_SHARDS" ] && [ -f "$MODEL_HOST/config.json" ] \
         && [ -f "$MODEL_HOST/model.safetensors.index.json" ] || need_model=1
+    [ "$need_model" = "0" ] && adopt_model_engram
     engram_complete || need_engram=1
     if [ "$need_model" = "1" ] && [ "$MODEL_SOURCE" = "local" ]; then
         die "MODEL=$MODEL_HOST is a local checkpoint but it is incomplete (${have:-0}/$EXPECTED_SHARDS shards, needs config.json + model.safetensors.index.json); local paths are never downloaded into"
@@ -360,6 +420,8 @@ fetch_weights() {
         mkdir -p "$MODEL_HOST"
         hf_fetch "$HF_MODEL_REPO" "$MODEL_HOST" "EXL3 weights" ${rev[@]+"${rev[@]}"}
         resolve_model_files
+        adopt_model_engram
+        engram_complete && need_engram=0
     fi
     if [ "$need_engram" = "1" ]; then
         log "fetching Engram shards 47+48 from ${HF_ENGRAM_REPO} into ${ENGRAM_DIR} (~190 GiB, resumable)"
@@ -630,7 +692,7 @@ pack_engram() {
     local r
     for r in $(seq 0 $((TP - 1))); do
         log "packing Engram rank ${r} of TP=${TP} into ${PACKED_DIR} ..."
-        docker run --rm -v "$ENGRAM_SRC:/models:ro" -v "$ENGRAM_DIR:$ENGRAM_DIR:ro" -v "$PACKED_DIR:/engram" \
+        docker run --rm -v "$ENGRAM_SRC:/models:ro" -v "$(cd "$ENGRAM_DIR" && pwd -P):$(cd "$ENGRAM_DIR" && pwd -P):ro" -v "$PACKED_DIR:/engram" \
             --entrypoint python3 "$IMAGE" \
             /opt/dsv41/pack_engram.py --model /models --rank "$r" --tp "$TP" --out /engram
     done
@@ -642,12 +704,16 @@ launch() {
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
     mkdir -p "$CACHE_ROOT" "$TRITON_HOST_CACHE" "$TILELANG_HOST_CACHE" "$LOGDIR"
 
-    # Checkpoint mount. A Hugging Face cache snapshot is a tree of relative
-    # symlinks into ../../blobs, so mount the whole models--org--name dir; any
-    # other symlinked tree is mounted at its own path along with its targets.
-    local -a modelmnt=(-v "$MODEL_HOST:/model:ro")
+    # Checkpoint mount. A model view (Engram shards hidden) or a symlinked tree
+    # is mounted at /model with the real files' directories at their own paths;
+    # a Hugging Face cache snapshot (relative links into ../../blobs) is mounted
+    # as its whole models--org--name dir.
+    local -a modelmnt=(-v "$MODEL_HOST:/model:ro") samepath=()
     MODEL_DIR=/model
-    if find "$MODEL_HOST" -maxdepth 1 -type l 2>/dev/null | grep -q .; then
+    if [ -n "$MODEL_VIEW" ]; then
+        modelmnt=(-v "$MODEL_VIEW:/model:ro")
+        while read -r d; do [ -n "$d" ] && samepath+=("$d"); done < <(link_target_dirs "$MODEL_VIEW")
+    elif find "$MODEL_HOST" -maxdepth 1 -type l 2>/dev/null | grep -q .; then
         case "$MODEL_HOST" in
             */snapshots/*)
                 modelmnt=(-v "${MODEL_HOST%/snapshots/*}:/hf-model:ro")
@@ -656,14 +722,18 @@ launch() {
             *)
                 modelmnt=(-v "$MODEL_HOST:$MODEL_HOST:ro")
                 MODEL_DIR="$MODEL_HOST"
-                local tdir
-                while read -r tdir; do
-                    [ -n "$tdir" ] && modelmnt+=(-v "$tdir:$tdir:ro")
-                done < <(find "$MODEL_HOST" -maxdepth 1 -type l -exec readlink -f {} \; | xargs -r -n1 dirname | sort -u | grep -vx "$MODEL_HOST" || true)
+                while read -r d; do [ -n "$d" ] && samepath+=("$d"); done < <(link_target_dirs "$MODEL_HOST")
                 ;;
         esac
         log "checkpoint is a symlinked tree — mounted so the links resolve (in-container ${MODEL_DIR})"
     fi
+    # Engram: the slim dir's links (when not hardlinks) point into ENGRAM_DIR.
+    samepath+=("$(cd "$ENGRAM_DIR" && pwd -P)")
+    while read -r d; do [ -n "$d" ] && samepath+=("$d"); done < <(link_target_dirs "$ENGRAM_SRC")
+    local d
+    while read -r d; do
+        [ -n "$d" ] && [ "$d" != "$MODEL_DIR" ] && modelmnt+=(-v "$d:$d:ro")
+    done < <(printf '%s\n' "${samepath[@]}" | sort -u)
 
     local -a packed=()
     if [ -f "$PACKED_DIR/engram-l1-r0of${TP}.bin" ]; then
@@ -712,7 +782,6 @@ launch() {
         --cap-add SYS_PTRACE --oom-score-adj 1000 \
         "${modelmnt[@]}" \
         -v "$ENGRAM_SRC:/engram-src:ro" \
-        -v "$ENGRAM_DIR:$ENGRAM_DIR:ro" \
         -v "$CACHE_ROOT:/root/.cache/vllm" \
         -v "$TRITON_HOST_CACHE:/root/.triton/cache" \
         -v "$TILELANG_HOST_CACHE:/root/.tilelang/cache" \
@@ -720,7 +789,7 @@ launch() {
         -v "$CHAT_TEMPLATE_HOST:$CHAT_TEMPLATE:ro" \
         -v "$EXL3_OVERLAY_HOST:/opt/dsv41/exl3.py:ro" \
         -v "$KMAP_HOST:/opt/dsv41/exl3_k_map.json:ro" \
-        "${ov[@]}" "${packed[@]}" "${env[@]}" \
+        "${ov[@]}" ${packed[@]+"${packed[@]}"} "${env[@]}" \
         -e NCCL_CUMEM_ENABLE=0 \
         -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
         -e VLLM_CACHE_ROOT=/root/.cache/vllm \
@@ -822,6 +891,7 @@ start() {
     preflight
     ensure_image
     prepare_engram_src_dir
+    prepare_model_view
     write_inner_scripts
     log "config: image=${IMAGE} tp=${TP} spec=${SPEC_METHOD} k=${DSPARK_TOKENS} max-len=${MAX_MODEL_LEN} mnbt=${MAX_NUM_BATCHED_TOKENS} kv-pool=${KV_CACHE_MEMORY_BYTES:-profiled} lm-only=${LANGUAGE_MODEL_ONLY} host-experts=${DSV41_EXL3_HOST_EXPERT_LAYERS:-none}"
     launch

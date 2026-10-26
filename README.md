@@ -89,6 +89,15 @@ Or set `MODEL=` in `.env` (same two forms). With nothing set, it uses Mia's 2.9b
 - **Checks:** the preflight prints the checkpoint's `quant_method`/`codebook`/`avg_bits` and warns when they don't
   match what the overlay loads.
 
+**DeepSeek 0909 vs 1017.** Both releases have the same architecture, config, tokenizer and prompt encoder,
+so the image serves either. Every shard differs, though, so the Engram tables (shards 47+48) must come from
+the same release as the quant. A checkpoint that bundles its own stock 47+48 is used as-is: the launcher
+points `ENGRAM_DIR` at it and hides those shards from the model loader. Otherwise, for a 1017 quant, set
+`HF_ENGRAM_REPO=deepseek-ai/DeepSeek-V4.1-Flash-1017`.
+
+`python3 scripts/inspect_checkpoint.py <dir>` reads only the shard headers and reports whether a checkpoint
+loads as-is: native linears where EXL3 is expected, index and shard mismatches, the K map, and bundled Engram.
+
 `./download.sh --model ...` stages a download without booting. For a quant other than Mia's 2.9bpw, re-check the
 VRAM split with `python3 scripts/weight_budget.py --model <dir> --host-expert-layers 33-39`.
 

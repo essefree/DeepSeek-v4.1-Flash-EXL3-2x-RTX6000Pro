@@ -122,6 +122,8 @@ def budget(model: Path, tp: int, host_layers: set[int] | None = None) -> dict:
         if e is None:
             continue
         b = nbytes(e)
+        if ".engram.embed." in name:
+            continue  # n-gram tables: file-backed host lookups, never GPU weights
         bucket, sharded = classify(name)
         total[bucket] += b
         if _expert_layer(name) in host_layers and name.endswith(".trellis"):

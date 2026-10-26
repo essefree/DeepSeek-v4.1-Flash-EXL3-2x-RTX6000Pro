@@ -45,8 +45,10 @@ def link_or_copy(src: Path, dst: Path) -> str:
         os.link(src, dst)
         return "hardlink"
     except OSError:
-        shutil.copy2(src, dst)
-        return "copy"
+        # Different filesystem: link to the real file instead of copying ~95 GiB.
+        # start.sh mounts the link targets' directories at the same path.
+        os.symlink(os.path.realpath(src), dst)
+        return "symlink"
 
 
 def prepare(src: Path, dst: Path) -> dict[str, object]:

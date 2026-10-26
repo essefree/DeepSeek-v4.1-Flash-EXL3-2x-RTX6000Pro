@@ -107,8 +107,9 @@ def main() -> int:
     # 2. Engram tables bundled in the model directory.
     eng = sorted({v["file"] for k, v in h.items() if ".engram.embed." in k})
     if eng:
-        notes.append(f"Engram tables are inside this directory ({', '.join(eng)}): ./start.sh must NOT load "
-                     "them as model weights — serve them via ENGRAM_DIR from a slim index instead")
+        notes.append(f"Engram tables are inside this directory ({', '.join(eng)}): ./start.sh uses them as "
+                     "ENGRAM_DIR and hides them from the model loader (a view without those shards); they "
+                     "must be from the same DeepSeek release (0909 or 1017) as the quant")
 
     # 3. K per tensor against the K map.
     km = json.loads(Path(a.kmap).read_text())
