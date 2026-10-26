@@ -2058,7 +2058,13 @@ class Exl3Config(QuantizationConfig):
         # (K=hidden, N=vocab shard). Checkpoint stores packed head.* not head.weight.
         if isinstance(layer, ParallelLMHead):
             return Exl3LinearMethod(self, prefix=prefix)
-        if isinstance(layer, LinearBase) and not _skip_exl3_linear(prefix):
+        if isinstance(layer, LinearBase):
+            if _skip_exl3_linear(prefix):
+                # LinearBase treats None as an error ("All linear layers should
+                # support quant method"); a plain .weight linear (router gate,
+                # DSV41_NATIVE_LINEARS such as an edited wo_b) takes vLLM's own
+                # unquantized method, exactly as with no quant_config at all.
+                return UnquantizedLinearMethod()
             return Exl3LinearMethod(self, prefix=prefix)
         return None
 
