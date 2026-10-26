@@ -159,6 +159,29 @@ def _check_lm_head_packed_shapes() -> None:
     print("exl3 lm_head packed shapes OK", flush=True)
 
 
+def _expected_sm() -> str:
+    """The cubin arch this image targets: TORCH_CUDA_ARCH_LIST=12.0a -> sm_120
+    (RTX PRO 6000 Blackwell, this fork), 12.1a -> sm_121 (GB10 / DGX Spark)."""
+    raw = os.environ.get("TORCH_CUDA_ARCH_LIST", "12.0a").split(";")[0].strip().rstrip("a")
+    major, minor = raw.split(".")
+    return f"sm_{major}{minor}"
+
+
+def _dump_arches(dump: str) -> set[str]:
+    """sm_XXX names in a `cuobjdump -lelf` listing (e.g. {'sm_120a'})."""
+    found: set[str] = set()
+    for line in dump.splitlines():
+        for tok in line.replace(".", " ").replace("_", "_").split():
+            if tok.startswith("sm_") or tok.startswith("compute_"):
+                found.add(tok)
+    return found
+
+
+def _arch_matches(dump: str, expected: str) -> bool:
+    j = dump.lower()
+    return expected in j or expected.replace("sm_", "compute_") in j
+
+
 def _check_ext_arch() -> None:
     import torch  # noqa: F401  — libc10 must load before the compiled ext
     import exllamav3_ext
@@ -168,21 +191,13 @@ def _check_ext_arch() -> None:
     print("exllamav3_ext.exl3_moe present", flush=True)
     so = exllamav3_ext.__file__
     dump = subprocess.check_output(["cuobjdump", "-lelf", so], text=True, stderr=subprocess.STDOUT)
-    arches = {
-        line.strip().split()[-1]
-        for line in dump.splitlines()
-        if "sm_" in line or "gencode" in line.lower()
-    }
-    joined = dump.lower()
-    has_121 = "sm_121" in joined or "compute_121" in joined
-    has_120_only = ("sm_120" in joined or "compute_120" in joined) and not has_121
-    if not has_121:
+    expected = _expected_sm()
+    if not _arch_matches(dump, expected):
         raise AssertionError(
-            f"exllamav3_ext is not an SM121 cubin ({so}):\n{dump[-2000:]}"
+            f"exllamav3_ext is not a {expected} cubin ({so}); found {sorted(_dump_arches(dump))} — "
+            f"TORCH_CUDA_ARCH_LIST={os.environ.get('TORCH_CUDA_ARCH_LIST', '<unset>')}:\n{dump[-2000:]}"
         )
-    if has_120_only:
-        raise AssertionError("exllamav3_ext is SM120-only; SM121 native kernels required")
-    print(f"exllamav3_ext arch OK {so} arches={sorted(arches) or 'see cuobjdump'}", flush=True)
+    print(f"exllamav3_ext arch OK {so} expected={expected} arches={sorted(_dump_arches(dump))}", flush=True)
 
 
 def _check_e2_diag_static() -> None:

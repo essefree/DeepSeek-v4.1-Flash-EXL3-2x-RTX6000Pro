@@ -13,7 +13,7 @@ full-precision expf/division to keep the E2 rounding boundaries.
 
 Usage:
   build_exl3_fat_moe_ext.py --src <dir with exl3_fat_moe.cu/.cuh> --out <build dir>
-                            [--install <site-packages dir>] [--arch 121a]
+                            [--install <site-packages dir>] [--arch 120a]
 """
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--ext", default=EXT_DEFAULT)
     ap.add_argument("--install", default="")
-    ap.add_argument("--arch", default="121a")
+    ap.add_argument("--arch", default="120a")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 

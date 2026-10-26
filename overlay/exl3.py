@@ -262,7 +262,7 @@ EXL3_FAT_MOE_SYMBOLS = (
     "exl3_fat_moe_tile_rows_gateup",
     "exl3_fat_moe_tile_rows_down",
 )
-# Grouped kernels: 16 B vector atomics (sm_90+); the image builds sm_121a.
+# Grouped kernels: 16 B vector atomics (sm_90+); this image builds sm_120a (RTX PRO 6000).
 EXL3_FAT_MOE_MIN_CAPABILITY = (9, 0)
 # Kernel interface generation this overlay speaks: 2 = (bits, cb)-generic
 # grouped kernels with separate gate/up gathered inputs (overlay/e3v2).
@@ -575,7 +575,7 @@ def _record_exl3_fat_resolution(layer: torch.nn.Module) -> None:
     diag["grouped_eligible"] = bool(grouped_eligible[0])
     diag["cap_major"] = cap_major
     diag["cap_minor"] = cap_minor
-    # LinearEXL3 (and the fat GEMM built on it) needs >= Ampere; GB10 is SM121.
+    # LinearEXL3 (and the fat GEMM built on it) needs >= Ampere; RTX PRO 6000 is SM120.
     diag["cap_ok"] = (cap_major, cap_minor) >= (8, 0)
     diag["tp_rank"], diag["tp_size"] = _exl3_tp_rank_size()
 
@@ -2011,7 +2011,7 @@ class Exl3Config(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # LinearEXL3 uses CUDA >= Ampere; GB10 is SM121.
+        # LinearEXL3 uses CUDA >= Ampere; RTX PRO 6000 is SM120.
         return 80
 
     @staticmethod
