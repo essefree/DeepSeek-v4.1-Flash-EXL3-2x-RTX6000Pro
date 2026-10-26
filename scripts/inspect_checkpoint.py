@@ -117,7 +117,10 @@ def main() -> int:
         missing = sorted(k for k in wm if k not in h)
         stray = sorted(k for k in h if k not in wm)
         if missing:
-            problems.append(f"index lists {len(missing)} tensors that no shard contains, e.g. {missing[:3]}")
+            # vLLM uses the index only to choose files and then loads every tensor in them,
+            # so stale entries (e.g. an index edited for a different layout) do not block loading.
+            notes.append(f"index lists {len(missing)} tensors that no shard contains (stale index; harmless), "
+                         f"e.g. {missing[:3]}")
         if stray:
             notes.append(f"{len(stray)} tensors are in shards but not in the index, e.g. {stray[:3]}")
 
